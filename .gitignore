@@ -1,0 +1,33 @@
+# 依赖目录
+node_modules/
+
+# 环境变量（包含敏感信息）
+.env
+.env.local
+.env.*.local
+
+# Egg.js 运行时文件
+logs/
+run/
+
+# 缓存目录
+.cache/
+
+# 自动生成的类型声明
+typings/
+
+# 编辑器配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 测试覆盖率
+coverage/
+
+# 构建输出
+dist/

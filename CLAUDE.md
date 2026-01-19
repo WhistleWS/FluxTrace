@@ -1,0 +1,166 @@
+# CLAUDE.md
+
+本文件为 Claude Code (claude.ai/code) 在此代码库中工作时提供指导。
+
+## 项目概述
+
+AI-Trace 是一个 Vue 应用数据流追踪工具，能够从 UI 元素反向追踪到数据源头（API、Store 或静态数据），并通过大模型生成结构化分析报告。
+
+**技术栈：**
+- Egg.js 3.x（Node.js 框架）
+- @vue/compiler-sfc + @vue/compiler-core（Vue SFC 解析）
+- @babel/parser + @babel/traverse + @babel/generator（JavaScript AST 分析）
+- LangChain + OpenAI 兼容 API（大模型调用）
+- Webpack stats.json（组件依赖图）
+
+## 开发命令
+
+```bash
+# 安装依赖
+npm install
+
+# 启动开发服务器（端口 3000，支持热重载）
+npm run dev
+
+# 生产环境启动
+npm run start
+
+# 停止生产服务
+npm run stop
+```
+
+## 架构概述
+
+### 目录结构
+
+```
+ai-trace/
+├── app.js              # Egg 应用启动钩子，初始化 WebpackService
+├── app/
+│   ├── router.js       # 路由定义（/api/analyze）
+│   ├── controller/
+│   │   └── analyze.js  # HTTP 层，参数获取和响应处理
+│   ├── service/
+│   │   ├── trace.js    # 核心追踪业务逻辑
+│   │   └── llm.js      # 大模型调用服务
+│   └── lib/
+│       ├── templateAST.js    # 模板 AST 分析
+│       ├── scriptAST.js      # 脚本 AST 分析与代码提纯
+│       ├── variableAST.js    # 变量提取与溯源
+│       ├── WebpackService.js # Webpack 依赖图解析
+│       ├── PromptService.js  # AI 提示词构造
+│       ├── apiExtractor.js   # API 接口信息提取
+│       ├── sfcTemplate.js    # SFC 模板处理
+│       └── utils/
+│           ├── traceUtils.js # 追踪工具函数
+│           ├── astUtils.js   # AST 工具函数
+│           ├── astConfig.js  # Babel 解析配置
+│           ├── pathUtils.js  # 路径处理工具
+│           └── cacheManager.js # 缓存管理
+├── config/
+│   └── config.default.js # Egg 默认配置
+└── test/               # 测试文件
+```
+
+### 核心工作流程
+
+1. **请求接收** - `/api/analyze` 接收文件路径、行号、列号
+2. **模板定位** - `templateAST.js` 根据坐标定位目标 DOM 元素
+3. **变量提取** - `variableAST.js` 从元素属性和插值中提取变量
+4. **脚本提纯** - `scriptAST.js` 只保留与目标变量相关的代码
+5. **组件溯源** - 若变量来自 props，通过 `WebpackService` 查找父组件
+6. **递归追踪** - 在父组件中继续追踪，直到找到数据源
+7. **AI 分析** - `PromptService.js` 构造提示词，调用大模型生成报告
+
+### 关键模块说明
+
+| 模块 | 功能 |
+|------|------|
+| `templateAST.js` | `findNodeInTemplate()` - 根据行列号定位模板元素 |
+| `scriptAST.js` | `pruneScript()` - 代码提纯，剔除无关逻辑 |
+| `variableAST.js` | `getUniversalVariables()` - 提取并溯源变量 |
+| `WebpackService.js` | 解析 stats.json 构建依赖图，查找父组件 |
+| `traceUtils.js` | `isFromProps()` / `findBindingInParent()` - 组件间追踪 |
+| `PromptService.js` | `runAIAnalysis()` - 构造提示词并调用大模型 |
+
+### 代码提纯规则
+
+`pruneScript()` 函数对脚本代码进行精简：
+- 保留与目标变量直接相关的代码
+- 剔除 `components`、`i18n`、`directives` 等非业务逻辑
+- 只保留包含业务变量的 `props`、`computed`、`methods`
+- 过滤不相关的生命周期钩子
+
+## API 接口
+
+### GET/POST /api/analyze
+
+**请求参数：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| path | string | 是 | Vue 组件文件相对路径 |
+| line | number | 是 | 目标元素所在行号 |
+| column | number | 是 | 目标元素所在列号 |
+
+**响应结构：**
+```json
+{
+  "message": "分析成功",
+  "targetElement": "<div>{{ amount }}</div>",
+  "traceChain": [...],
+  "aiAnalysis": {
+    "fullLinkTrace": "数据流转描述",
+    "dataSource": { "type": "API", "endpoint": "/api/xxx" },
+    "componentAnalysis": [...]
+  }
+}
+```
+
+## 环境变量
+
+在 `.env` 文件中配置：
+
+```bash
+AI_API_KEY=your-api-key        # 大模型 API Key
+AI_BASE_URL=https://api.xxx    # 大模型 API 地址
+AI_MODEL_NAME=model-name       # 模型名称
+```
+
+可选：
+- `PORT` - 服务端口（默认 3000）
+- `PROJECT_ROOT` - 项目根目录（默认为 ai-trace 上级目录）
+
+## 前置依赖
+
+需要在被分析的 Vue 项目根目录生成 `stats.json`：
+
+```bash
+# 在 vue-antd-admin 根目录执行
+ANALYZE=true yarn build
+# 或
+npx webpack --profile --json > stats.json
+```
+
+## 与前端集成
+
+前端项目（vue-antd-admin）通过 `code-inspector-plugin` 监听点击事件：
+
+```javascript
+// src/main.ts
+window.addEventListener('code-inspector:trackCode', (event) => {
+  const { path, line, column } = event.detail;
+  fetch(`http://localhost:3000/api/analyze?path=${path}&line=${line}&column=${column}`);
+});
+```
+
+## 关键文件
+
+| 文件 | 说明 |
+|------|------|
+| `app.js` | 应用启动钩子，初始化 WebpackService |
+| `app/service/trace.js` | 核心追踪逻辑入口 |
+| `app/lib/scriptAST.js` | 脚本 AST 分析与提纯 |
+| `app/lib/WebpackService.js` | Webpack 依赖图服务 |
+| `app/lib/PromptService.js` | AI 提示词构造 |
+| `config/config.default.js` | Egg 配置（端口、CORS、项目路径） |

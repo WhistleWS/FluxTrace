@@ -1,0 +1,585 @@
+/**
+ * Trace Service：核心溯源逻辑
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🎯 核心功能：从用户点击位置反向追踪数据来源
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 📚 技术背景：什么是数据溯源？
+ *
+ * 用户在页面上点击一个元素（如显示金额的 <span>），我们需要回答：
+ * - 这个数据是从哪里来的？
+ * - 经过了哪些组件的传递？
+ * - 最终的数据源是 API、Vuex 还是写死的？
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 📊 完整追踪流程图：
+ *
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  用户点击：<span>{{ amount }}</span>                        │
+ *   │  位置：src/views/Dashboard.vue 第 42 行                     │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 1: 解析 Vue 文件，定位 AST 节点                       │
+ *   │  使用 templateAST.js 的 findNodeInTemplate                 │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 2: 提取变量                                           │
+ *   │  使用 variableAST.js 的 getUniversalVariables              │
+ *   │  结果：['amount']                                           │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 3: 代码提纯                                           │
+ *   │  使用 scriptAST.js 的 pruneScript                          │
+ *   │  只保留与 amount 相关的代码                                 │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 4: 判断数据来源                                       │
+ *   │  - 来自 props？ → 继续追踪父组件                            │
+ *   │  - 来自 Vuex？  → 追踪 Store 定义                           │
+ *   │  - 来自 data？  → 追踪赋值语句                              │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *              ┌────────────┴────────────┐
+ *              ▼                         ▼
+ *   ┌──────────────────┐      ┌──────────────────────────────────┐
+ *   │  来自 props      │      │  找到数据源（API/Vuex/静态）     │
+ *   │  ↓               │      │  → 结束追踪                      │
+ *   │  查找父组件      │      └──────────────────────────────────┘
+ *   │  (WebpackService)│
+ *   │  ↓               │
+ *   │  回到 Step 1     │
+ *   └──────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 5: 构建追踪链                                         │
+ *   │  traceChain = [子组件信息, 父组件信息, ...]                │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                           │
+ *                           ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Step 6: 调用 AI 分析                                       │
+ *   │  把提纯后的代码发给大模型，生成结构化分析报告               │
+ *   └─────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 📊 追踪链示例：
+ *
+ *   用户点击 ChartCard 组件中的 amount：
+ *
+ *   traceChain = [
+ *     {
+ *       file: 'src/components/ChartCard.vue',
+ *       tag: 'span',
+ *       source: '<span>{{ amount }}</span>',
+ *       prunedScript: 'props: { amount: Number }',
+ *       callSnippet: ''
+ *     },
+ *     {
+ *       file: 'src/views/Dashboard.vue',
+ *       tag: 'ChartCard',
+ *       source: '<ChartCard :amount="totalAmount" />',
+ *       prunedScript: 'computed: { totalAmount() { return this.data.amount } }',
+ *       callSnippet: '<ChartCard :amount="totalAmount" />'
+ *     }
+ *   ]
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+'use strict';
+
+const Service = require('egg').Service;
+const fs = require('fs');
+const path = require('path');
+
+const { findNodeInTemplate } = require('../lib/templateAST');
+const { pruneScript } = require('../lib/scriptAST');
+const { getUniversalVariables } = require('../lib/variableAST');
+const webpackService = require('../lib/WebpackService');
+const {
+  isFromProps,
+  findBindingInParent,
+  findVuexDefinition,
+  getVuexSource,
+  findMutationTriggers,
+} = require('../lib/utils/traceUtils');
+const { parseSfcTemplate, normalizeLineColumn } = require('../lib/sfcTemplate');
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 常量定义
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 最大追踪深度
+ * 防止循环引用导致无限循环
+ */
+const MAX_TRACE_DEPTH = 10;
+
+class TraceService extends Service {
+  /**
+   * 分析入口：从用户点击位置溯源到数据源头，并调用大模型生成结构化分析
+   * @param {Object} params
+   * @param {string} params.path 相对项目根目录的 Vue 文件路径
+   * @param {number} params.line 1-based 行号
+   * @param {number} params.column 0-based 列号
+   *
+   * ═══════════════════════════════════════════════════════════════════════════
+   * 📝 参数说明
+   *
+   * 这些参数来自前端的 code-inspector-plugin 插件：
+   * - path: 用户点击的元素所在的 Vue 文件路径
+   * - line: 元素在文件中的行号（从 1 开始）
+   * - column: 元素在行中的列号（从 0 开始）
+   *
+   * 📊 示例：
+   *   用户点击了 src/views/Dashboard.vue 第 42 行的一个 span
+   *   参数：{ path: 'src/views/Dashboard.vue', line: 42, column: 8 }
+   * ═══════════════════════════════════════════════════════════════════════════
+   */
+  async analyze({ path: currentRelativePath, line, column }) {
+    const { ctx, app } = this;
+
+    // 项目根目录（用于拼接完整路径）
+    const projectRoot = app.config.projectRoot;
+
+    // 追踪链：记录从子组件到父组件的完整追踪路径
+    const traceChain = [];
+
+    // 当前追踪的位置（会随着向上追踪而改变）
+    let currentLine = Number.isFinite(line) ? line : NaN;
+    let currentColumn = Number.isFinite(column) ? column : NaN;
+
+    // 迭代计数器（防止无限循环）
+    let iteration = 0;
+
+    /**
+     * 调用片段传递机制
+     *
+     * 📝 场景：子组件的变量来自 props，需要追踪到父组件
+     *
+     * 当我们在父组件中找到 <ChildComponent :amount="xxx" /> 时，
+     * 需要把这段代码保存下来，在下一轮迭代中作为 callSnippet 展示。
+     *
+     * 这样 AI 就能看到完整的数据流：
+     * 父组件的 xxx -> 子组件的 props.amount -> 子组件模板中的 {{ amount }}
+     */
+    let nextCallSnippet = '';
+
+    while (currentRelativePath && iteration < MAX_TRACE_DEPTH) {
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 1: 读取并解析 Vue 文件
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const fullPath = path.join(projectRoot, currentRelativePath);
+      if (!fs.existsSync(fullPath)) break;
+
+      const fileContent = fs.readFileSync(fullPath, 'utf-8');
+
+      /**
+       * 坐标规范化
+       *
+       * 📝 问题：用户点击可能落在行尾空白处
+       * 解决：把 column 限制到本行最后一个非空白字符
+       */
+      const normalized = normalizeLineColumn(fileContent, currentLine, currentColumn);
+      currentLine = normalized.line;
+      currentColumn = normalized.column;
+
+      // 解析 Vue SFC（单文件组件）
+      const parsed = parseSfcTemplate({
+        projectRoot,
+        fileContent,
+        filename: currentRelativePath,
+      });
+      if (!parsed || !parsed.descriptor || !parsed.descriptor.template) break;
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 2: 定位模板中的目标节点
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      let targetNode = null;
+
+      if (parsed.kind === 'vue3') {
+        /**
+         * Vue3 坐标转换
+         *
+         * Vue3 的 template AST 行号是相对于 <template> 标签内部的
+         * 需要从文件行号减去 template 的起始行号
+         *
+         * 示例：
+         *   <template>     <- 第 10 行 (descriptor.template.loc.start.line)
+         *     <div>        <- 第 11 行 (文件) = 第 2 行 (template 内)
+         */
+        const templateStartLine = parsed.descriptor.template.loc.start.line;
+        const targetLineInTemplate = currentLine - templateStartLine + 1;
+        targetNode = findNodeInTemplate(parsed.templateAST, targetLineInTemplate, currentColumn);
+      } else {
+        /**
+         * Vue2 坐标转换
+         *
+         * Vue2 的处理更复杂，因为 component-compiler-utils 会对模板做 de-indent
+         * （去除公共缩进），导致列号需要额外调整
+         *
+         * 步骤：
+         * 1. fileLine -> templateLine（减去 template 起始行）
+         * 2. fileColumn -> templateColumn（减去公共缩进）
+         * 3. 再次 normalize（防止越界）
+         */
+        const templateLine = currentLine - parsed.templateStartLoc.line + 1;
+        const columnAdjusted = Math.max(0, currentColumn - (parsed.templateBaseIndent || 0));
+        const templateNormalized = normalizeLineColumn(parsed.templateSource, templateLine, columnAdjusted);
+
+        targetNode = findNodeInTemplate(
+          parsed.templateAST,
+          templateNormalized.line,
+          templateNormalized.column,
+          null,
+          parsed.templateSource
+        );
+      }
+
+      // 没找到目标节点，终止追踪
+      if (!targetNode) break;
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 3: 提取变量
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const entryVars = getUniversalVariables(targetNode);
+
+      /**
+       * 静态内容检测
+       *
+       * 如果没有提取到任何变量，说明用户点击的是写死的静态文本
+       * 例如：<span>Alipay</span>
+       *
+       * 这种情况直接返回结果，不需要追踪和 AI 分析
+       */
+      if (entryVars.length === 0) {
+        const staticSource = parsed.getNodeSource(targetNode);
+        return this.buildStaticContentResult(currentRelativePath, targetNode.tag, staticSource);
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 4: 代码提纯
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const rawScript = parsed.descriptor.scriptSetup?.content || parsed.descriptor.script?.content || '';
+      const prunedScript = pruneScript(rawScript, entryVars);
+
+      // 构建当前层级的追踪信息
+      const stepInfo = {
+        file: currentRelativePath,
+        tag: targetNode.tag,
+        prunedScript,
+        source: parsed.getNodeSource(targetNode),
+        callSnippet: nextCallSnippet,  // 来自上一层的调用片段
+      };
+
+      // 清空调用片段（已被当前层级消费）
+      nextCallSnippet = '';
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 5: 判断是否需要继续向上追踪（props 溯源）
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      /**
+       * Props 溯源逻辑
+       *
+       * 如果变量来自 props，说明数据是父组件传入的
+       * 需要：
+       * 1. 通过 WebpackService 找到父组件
+       * 2. 在父组件中找到调用当前组件的代码
+       * 3. 继续在父组件中追踪
+       */
+      const primaryVar = entryVars[0];
+      let shouldContinue = false;
+
+      if (primaryVar && isFromProps(rawScript, primaryVar)) {
+        // 查找引用当前组件的父组件
+        const parents = webpackService.getParents(currentRelativePath);
+
+        if (parents.length > 0) {
+          const parentRelativePath = parents[0];
+          const parentFullPath = path.resolve(projectRoot, parentRelativePath);
+          const childClassName = path.basename(currentRelativePath, '.vue');
+
+          // 在父组件中查找绑定代码，如 <ChartCard :amount="xxx" />
+          const binding = findBindingInParent(parentFullPath, childClassName, primaryVar);
+
+          if (binding) {
+            // 保存调用片段，供下一轮迭代使用
+            nextCallSnippet = binding.rawTag;
+
+            // 更新追踪位置到父组件
+            currentRelativePath = parentRelativePath;
+            currentLine = binding.line;
+            currentColumn = binding.column;
+            shouldContinue = true;
+          }
+        }
+      }
+
+      // 当前层级信息入栈
+      traceChain.push(stepInfo);
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Phase 6: Vuex 数据溯源（可选）
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      /**
+       * Vuex 溯源
+       *
+       * 如果变量来自 Vuex（mapState/mapGetters），
+       * 我们还需要追踪到 Store 的定义，找出：
+       * - State/Getter 的具体实现
+       * - 哪些 Mutation 会修改这个 State
+       * - 这些 Mutation 在哪里被触发
+       */
+      const vuexMapping = findVuexDefinition(stepInfo.prunedScript, entryVars);
+
+      if (vuexMapping) {
+        const storeSource = getVuexSource(projectRoot, vuexMapping);
+
+        if (storeSource) {
+          // 构建 Vuex 追踪信息
+          const vuexTraceInfo = this.buildVuexTraceInfo(vuexMapping, storeSource, projectRoot);
+          traceChain.push(vuexTraceInfo);
+
+          // Vuex 通常就是数据源头，终止追踪
+          break;
+        }
+      }
+
+      if (!shouldContinue) break;
+      iteration++;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 7: 构造 AI 分析所需的代码文本
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /**
+     * 为什么要 reverse？
+     *
+     * traceChain 的顺序是：[子组件, 父组件, 祖父组件, ...]
+     * 但对于 AI 分析，我们希望从数据源头开始讲述：
+     * [祖父组件(数据源), 父组件(中转), 子组件(展示)]
+     *
+     * 📊 示例：
+     *
+     *   原始顺序（追踪顺序）：
+     *   ChartCard.vue → Dashboard.vue → App.vue
+     *
+     *   反转后（数据流顺序）：
+     *   App.vue → Dashboard.vue → ChartCard.vue
+     */
+    const finalCodeForAI = traceChain
+      .reverse()
+      .map(step => {
+        /**
+         * 构建每个追踪层级的代码片段
+         *
+         * 格式：
+         * // File: src/views/Dashboard.vue
+         * // [Template] 目标 DOM 元素:
+         * <span>{{ amount }}</span>
+         *
+         * // [Data Flow] 模板中调用子组件的代码:
+         * <ChartCard :amount="totalAmount" />
+         *
+         * // [Logic] 关联的脚本逻辑:
+         * computed: { totalAmount() { return this.data.amount } }
+         */
+        let output = `// File: ${step.file}\n`;
+
+        // 添加目标 DOM 元素，让 AI 知道我们在追踪哪个元素
+        if (step.source) {
+          output += `// [Template] 目标 DOM 元素:\n${step.source}\n\n`;
+        }
+
+        // 添加父子组件的调用关系
+        if (step.callSnippet) {
+          output += `// [Data Flow] 模板中调用子组件的代码:\n${step.callSnippet}\n\n`;
+        }
+
+        // 添加关联的脚本逻辑
+        output += `// [Logic] 关联的脚本逻辑:\n${step.prunedScript || '// (该层级无相关脚本逻辑)'}`;
+        return output;
+      })
+      .join('\n\n' + '='.repeat(25) + '\n\n');
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 8: 调用 AI 分析
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /**
+     * AI 分析流程
+     *
+     * 把追踪到的代码片段发送给大模型，让它：
+     * 1. 理解数据的完整流转路径
+     * 2. 识别数据源类型（API/Vuex/静态）
+     * 3. 生成结构化的分析报告
+     */
+    const finalTrace = [...traceChain].reverse();
+    const originalTargetElement = finalTrace[0]?.source || '未知元素';
+
+    ctx.logger.info('--- 启动 AI 智能逻辑分析 ---');
+    ctx.logger.info(`[点击元素] ${originalTargetElement}`);
+
+    // 调用 LLM 服务进行智能分析
+    const aiAnalysis = await ctx.service.llm.analyze({
+      finalCodeForAI,
+      targetElement: originalTargetElement,
+      traceChain: finalTrace,
+    });
+
+    // 在结果中追加点击元素信息，方便用户区分多次点击的结果
+    const enrichedAnalysis = {
+      ...aiAnalysis,
+      clickedElement: originalTargetElement,
+    };
+
+    ctx.logger.info('--- AI 智能逻辑结果 ---');
+    ctx.logger.info(`[点击元素] ${originalTargetElement}`);
+    ctx.logger.info(enrichedAnalysis);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 9: 构造最终返回结果
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /**
+     * 返回结构说明
+     *
+     * @returns {Object} 分析结果
+     * @property {string} message - 状态消息
+     * @property {string} targetElement - 用户点击的 DOM 元素源码
+     * @property {Array} traceChain - 完整的追踪链
+     * @property {Object} aiAnalysis - AI 生成的分析报告
+     * @property {string} finalCodeForAI - 发送给 AI 的代码文本
+     */
+    return {
+      message: '分析成功',
+      targetElement: originalTargetElement,
+      traceChain,
+      aiAnalysis: enrichedAnalysis,
+      finalCodeForAI,
+    };
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 辅助方法
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /**
+   * 构建静态内容结果
+   *
+   * 📝 使用场景：用户点击的是写死的静态文本，如 <span>Alipay</span>
+   *
+   * @param {string} file - 文件路径
+   * @param {string} tag - 标签名
+   * @param {string} source - 元素源码
+   * @returns {Object} 静态内容分析结果
+   *
+   * 📊 示例：
+   *
+   *   用户点击：<span>Alipay</span>
+   *
+   *   返回：
+   *   {
+   *     message: '静态内容',
+   *     targetElement: '<span>Alipay</span>',
+   *     traceChain: [{...}],
+   *     aiAnalysis: {
+   *       dataSource: { type: 'static', description: '写死的静态文本' }
+   *     }
+   *   }
+   */
+  buildStaticContentResult(file, tag, source) {
+    return {
+      message: '静态内容',
+      targetElement: source,
+      traceChain: [{
+        file,
+        tag,
+        source,
+        prunedScript: '',
+        callSnippet: '',
+      }],
+      aiAnalysis: {
+        fullLinkTrace: '该元素为静态内容，无需追踪数据来源',
+        dataSource: {
+          type: 'static',
+          description: '写死的静态文本，不涉及动态数据',
+        },
+        componentAnalysis: [{
+          file,
+          role: '展示静态内容',
+          dataFlow: '无数据流转',
+        }],
+      },
+      finalCodeForAI: '',
+    };
+  }
+
+  /**
+   * 构建 Vuex 追踪信息
+   *
+   * 📝 使用场景：变量来自 Vuex 的 mapState/mapGetters
+   *
+   * @param {Object} vuexMapping - Vuex 映射信息
+   * @param {string} vuexMapping.namespace - 模块命名空间（如 'user'）
+   * @param {string} vuexMapping.type - 映射类型（'state' 或 'getter'）
+   * @param {string} vuexMapping.key - 映射的键名
+   * @param {string} storeSource - Store 模块的源码
+   * @param {string} projectRoot - 项目根目录
+   * @returns {Object} Vuex 追踪层级信息
+   *
+   * 📊 示例：
+   *
+   *   组件中：...mapState('user', ['userInfo'])
+   *
+   *   返回：
+   *   {
+   *     file: 'src/store/modules/user.js',
+   *     tag: 'VuexStore',
+   *     source: 'state: { userInfo: null }',
+   *     prunedScript: '完整的 store 相关代码',
+   *     callSnippet: '',
+   *     isVuex: true,
+   *     vuexInfo: { namespace: 'user', type: 'state', key: 'userInfo' }
+   *   }
+   */
+  buildVuexTraceInfo(vuexMapping, storeSource, projectRoot) {
+    const { namespace, type, key } = vuexMapping;
+
+    // 构建 Store 文件路径
+    const storeFile = namespace
+      ? `src/store/modules/${namespace}.js`
+      : 'src/store/index.js';
+
+    // 查找可能修改这个 state 的 mutations
+    const mutationTriggers = findMutationTriggers(projectRoot, namespace, key);
+
+    return {
+      file: storeFile,
+      tag: 'VuexStore',
+      source: storeSource,
+      prunedScript: storeSource,
+      callSnippet: '',
+      isVuex: true,
+      vuexInfo: {
+        namespace,
+        type,
+        key,
+        mutationTriggers,  // 哪些地方触发了 mutation
+      },
+    };
+  }
+}
+
+module.exports = TraceService;
+

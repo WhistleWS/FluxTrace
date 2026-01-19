@@ -1,0 +1,40 @@
+{
+  "name": "ai-trace-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "export NODE_OPTIONS=--openssl-legacy-provider && egg-scripts start --port=3000 --title=ai-trace-server",
+    "stop": "egg-scripts stop --title=ai-trace-server",
+    "dev": "export NODE_OPTIONS=--openssl-legacy-provider && egg-bin dev --port=3000"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@babel/generator": "^7.28.5",
+    "@babel/parser": "^7.28.5",
+    "@babel/traverse": "^7.28.5",
+    "@langchain/openai": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "@vue/compiler-sfc": "^3.5.26",
+    "@vue/component-compiler-utils": "^3.3.0",
+    "dotenv": "^16.4.5",
+    "egg": "^3.32.0",
+    "egg-bin": "^6.13.0",
+    "egg-cors": "^3.0.1",
+    "egg-scripts": "^3.1.0",
+    "langchain": "^1.2.3",
+    "node-fetch": "^2.7.0",
+    "vue-template-compiler": "^2.6.11",
+    "webpack": "^5.104.1",
+    "webpack-cli": "^5.1.4",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@babel/plugin-proposal-nullish-coalescing-operator": "^7.18.6",
+    "@babel/plugin-proposal-optional-chaining": "^7.21.0"
+  }
+}
