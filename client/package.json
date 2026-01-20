@@ -1,0 +1,22 @@
+{
+  "name": "flux-trace-client",
+  "version": "1.0.0",
+  "description": "FluxTrace 前端 SDK - Vue 数据流追踪工具客户端",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "keywords": [
+    "vue",
+    "trace",
+    "debug",
+    "data-flow",
+    "code-inspector",
+    "flux-trace"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  }
+}
