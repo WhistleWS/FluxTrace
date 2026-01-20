@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-AI-Trace 是一个 Vue 应用数据流追踪工具，能够从 UI 元素反向追踪到数据源头（API、Store 或静态数据），并通过大模型生成结构化分析报告。
+FluxTrace 是一个 Vue 应用数据流追踪工具，能够从 UI 元素反向追踪到数据源头（API、Store 或静态数据），并通过大模型生成结构化分析报告。
 
 **技术栈：**
 - Egg.js 3.x（Node.js 框架）
@@ -34,8 +34,15 @@ npm run stop
 ### 目录结构
 
 ```
-ai-trace/
+FluxTrace/
 ├── app.js              # Egg 应用启动钩子，初始化 WebpackService
+├── client/             # 前端 SDK（独立模块）
+│   ├── index.js        # SDK 入口，提供 initFluxTrace() 和 analyze()
+│   ├── index.d.ts      # TypeScript 类型声明
+│   ├── package.json    # npm 包配置
+│   └── README.md       # SDK 使用说明
+├── plugins/            # 构建工具插件
+│   └── webpack.js      # Webpack 插件，自动注入监听脚本
 ├── app/
 │   ├── router.js       # 路由定义（/api/analyze）
 │   ├── controller/
@@ -129,7 +136,7 @@ AI_MODEL_NAME=model-name       # 模型名称
 
 可选：
 - `PORT` - 服务端口（默认 3000）
-- `PROJECT_ROOT` - 项目根目录（默认为 ai-trace 上级目录）
+- `PROJECT_ROOT` - 项目根目录（默认为 FluxTrace 上级目录）
 
 ## 前置依赖
 
@@ -144,14 +151,45 @@ npx webpack --profile --json > stats.json
 
 ## 与前端集成
 
-前端项目（vue-antd-admin）通过 `code-inspector-plugin` 监听点击事件：
+FluxTrace 提供两种集成方式：
+
+### 方式 A：SDK 引入（推荐）
+
+在项目入口文件中初始化：
+
+```typescript
+// src/main.ts
+import { initFluxTrace } from '../FluxTrace/client';
+
+initFluxTrace({
+  baseUrl: 'http://localhost:3000',  // 可选，后端地址
+  onlyDev: true,                      // 可选，默认仅开发环境
+  silent: false,                      // 可选，是否静默模式
+  onSuccess: (result) => {},          // 可选，成功回调
+  onError: (error) => {}              // 可选，失败回调
+});
+```
+
+### 方式 B：Webpack 插件（零配置）
+
+在 `vue.config.js` 中配置：
 
 ```javascript
-// src/main.ts
-window.addEventListener('code-inspector:trackCode', (event) => {
-  const { path, line, column } = event.detail;
-  fetch(`http://localhost:3000/api/analyze?path=${path}&line=${line}&column=${column}`);
-});
+const { createFluxTracePlugins } = require('./FluxTrace/plugins/webpack');
+
+module.exports = {
+  configureWebpack: {
+    plugins: [...createFluxTracePlugins({ port: 3000 })]
+  }
+};
+```
+
+### 前置条件
+
+需要在宿主项目安装 `code-inspector-plugin`：
+
+```bash
+npm install code-inspector-plugin -D
 ```
 
 ## 关键文件

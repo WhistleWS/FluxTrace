@@ -22,6 +22,6 @@ module.exports = app => {
 
     // WebpackService 内部已做 try/catch 与降级逻辑，这里 await 只保证初始化顺序
     await webpackService.init(statsPath);
-    app.coreLogger.info('[ai-trace] Webpack 依赖图初始化完成');
+    app.coreLogger.info('[FluxTrace] Webpack 依赖图初始化完成');
   });
 };

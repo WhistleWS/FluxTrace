@@ -1,5 +1,5 @@
 /**
- * AI-Trace 分析入口 Controller
+ * FluxTrace 分析入口 Controller
  *
  * 迁移说明：
  * - 旧版 Express 直接在 index.js 里实现 /api/analyze 的所有逻辑；

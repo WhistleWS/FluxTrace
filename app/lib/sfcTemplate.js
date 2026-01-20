@@ -175,9 +175,9 @@ function parseSfcTemplate({ projectRoot, fileContent, filename }) {
   /**
    * 选择解析器策略：
    * - 默认根据项目 vue 主版本选择（Vue2 优先 / Vue3 优先）
-   * - 可通过环境变量 AI_TRACE_VUE=2|3 强制指定
+   * - 可通过环境变量 FLUX_TRACE_VUE=2|3 强制指定
    */
-  const forced = process.env.AI_TRACE_VUE;
+  const forced = process.env.FLUX_TRACE_VUE;
   const vueMajor = getVueMajor(projectRoot);
   const preferVue2 = forced === '2' || (forced !== '3' && vueMajor === 2);
 

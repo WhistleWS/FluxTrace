@@ -3,8 +3,8 @@
  *
  * 迁移说明：
  * - Express 版本固定监听 3000 端口；为了保持前端不改配置，这里也默认用 3000。
- * - 旧逻辑里 PROJECT_ROOT = path.resolve(__dirname, '..')（ai-trace 的上一级，也就是 vue-antd-admin 根目录）
- *   Egg 下 baseDir 是 ai-trace，因此 projectRoot 默认仍取 baseDir 的上一级。
+ * - 旧逻辑里 PROJECT_ROOT = path.resolve(__dirname, '..')（FluxTrace 的上一级，也就是 vue-antd-admin 根目录）
+ *   Egg 下 baseDir 是 FluxTrace，因此 projectRoot 默认仍取 baseDir 的上一级。
  */
 
 'use strict';
