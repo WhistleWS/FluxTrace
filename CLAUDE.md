@@ -73,11 +73,44 @@ FluxTrace/
 
 1. **请求接收** - `/api/analyze` 接收文件路径、行号、列号
 2. **模板定位** - `templateAST.js` 根据坐标定位目标 DOM 元素
-3. **变量提取** - `variableAST.js` 从元素属性和插值中提取变量
-4. **脚本提纯** - `scriptAST.js` 只保留与目标变量相关的代码
-5. **组件溯源** - 若变量来自 props，通过 `WebpackService` 查找父组件
-6. **递归追踪** - 在父组件中继续追踪，直到找到数据源
-7. **AI 分析** - `PromptService.js` 构造提示词，调用大模型生成报告
+3. **变量提取** - `variableAST.js` 从元素属性和插值中提取变量（分三类：content/attributes/conditionals）
+4. **多链路追踪** - 对每类变量独立追踪，共享 SFC 缓存避免重复解析
+5. **脚本提纯** - `scriptAST.js` 只保留与目标变量相关的代码
+6. **组件溯源** - 若变量来自 props，通过 `WebpackService` 查找父组件
+7. **递归追踪** - 在父组件中继续追踪，直到找到数据源
+8. **AI 分析** - `PromptService.js` 构造提示词，调用大模型生成报告
+
+### 多链路追踪架构
+
+变量按来源分为三类，各自独立追踪：
+
+| 类别 | 说明 | 示例 |
+|------|------|------|
+| `content` | 文本插值变量 | `{{ amount }}` |
+| `attributes` | 动态属性绑定 | `:class="containerClass"` |
+| `conditionals` | 条件渲染变量 | `v-if="isVisible"` |
+
+```javascript
+// 三条追踪链独立运行，共享 sfcCache
+const traceChains = {
+  content: await this.traceCategory('content', contentVars, { sfcCache }),
+  attributes: await this.traceCategory('attributes', attrVars, { sfcCache }),
+  conditionals: await this.traceCategory('conditionals', condVars, { sfcCache }),
+};
+```
+
+### 请求级 SFC 缓存
+
+为避免多链路追踪时重复解析同一文件，采用请求级缓存：
+
+```javascript
+// 缓存结构：Map<absolutePath, { parsed, fileContent }>
+const sfcCache = new Map();
+
+// 优化效果示例（3变量 × 3层深度）：
+// 优化前：13 次解析
+// 优化后：3 次解析（仅首次 MISS）
+```
 
 ### 关键模块说明
 
@@ -85,10 +118,33 @@ FluxTrace/
 |------|------|
 | `templateAST.js` | `findNodeInTemplate()` - 根据行列号定位模板元素 |
 | `scriptAST.js` | `pruneScript()` - 代码提纯，剔除无关逻辑 |
-| `variableAST.js` | `getUniversalVariables()` - 提取并溯源变量 |
+| `variableAST.js` | `getUniversalVariables()` - 提取并溯源变量（支持 Vue2/Vue3） |
+| `sfcTemplate.js` | `parseSfcTemplate()` - SFC 解析，自动选择 Vue2/Vue3 编译器 |
 | `WebpackService.js` | 解析 stats.json 构建依赖图，查找父组件 |
-| `traceUtils.js` | `isFromProps()` / `findBindingInParent()` - 组件间追踪 |
+| `traceUtils.js` | `isFromProps()` / `findBindingInParent()` - 组件间追踪（支持缓存） |
 | `PromptService.js` | `runAIAnalysis()` - 构造提示词并调用大模型 |
+
+### Vue2 兼容性处理
+
+Vue2 的 `vue-template-compiler` 在处理动态属性时，会将 `:class`、`:style` 等绑定从 `attrsList` 移至 `rawAttrsMap`。变量提取时优先读取 `rawAttrsMap`：
+
+```javascript
+// variableAST.js 中的兼容处理
+let attrsToProcess = [];
+if (node.rawAttrsMap && Object.keys(node.rawAttrsMap).length > 0) {
+    attrsToProcess = Object.values(node.rawAttrsMap);
+} else if (node.attrsList && node.attrsList.length > 0) {
+    attrsToProcess = node.attrsList;
+}
+```
+
+### 节点源码截断
+
+对于带 `v-for` 的大型容器元素，`getNodeSource()` 会自动截断，避免 AI Token 溢出：
+
+- **最大长度**：500 字符
+- **最大行数**：10 行
+- **截断策略**：仅保留开标签，添加省略注释
 
 ### 代码提纯规则
 

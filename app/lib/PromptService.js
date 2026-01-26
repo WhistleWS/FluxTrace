@@ -33,12 +33,13 @@ function stripCodeFences(text) {
 /**
  * AI 分析服务：实现七层 Prompt 架构
  *
- * 本次改动要点（对应架构文档的“智能分析层/接口信息层”）：
+ * 本次改动要点（对应架构文档的"智能分析层/接口信息层"）：
  * 1) 第六层 api_info 不再是单一正则字符串，而是来自 apiExtractor 的结构化证据列表（最多 30 条）
  * 2) 输出 schema 收紧（type/method 枚举、endpoint 可为空）提升一致性
- * 3) 增加“解析失败自修复”：第一次解析失败时，触发第二次 prompt 只做 JSON 修复，不允许新增事实
+ * 3) 增加"解析失败自修复"：第一次解析失败时，触发第二次 prompt 只做 JSON 修复，不允许新增事实
+ * 4) 支持多链路追踪输入（content/attributes/conditionals）
  */
-async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
+async function runAIAnalysis(finalCodeForAI, targetElement, traceChains) {
 
   // 1. 初始化模型
   const model = new ChatOpenAI({
@@ -52,9 +53,16 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
 
   /**
    * 第六层：接口信息提取（证据驱动）
-   * - 提取结果会直接喂给模型，要求模型“有证据才下结论”，降低胡编 endpoint/method 的概率。
+   * - 提取结果会直接喂给模型，要求模型"有证据才下结论"，降低胡编 endpoint/method 的概率。
+   * - 多链路模式：合并三条链路中的所有步骤用于 API 证据提取
    */
-  const apiEvidence = extractApiEvidence({ traceChain });
+  // 合并多链路为扁平数组，供 apiExtractor 使用
+  const allChainSteps = [
+    ...(traceChains?.content || []),
+    ...(traceChains?.attributes || []),
+    ...(traceChains?.conditionals || []),
+  ];
+  const apiEvidence = extractApiEvidence({ traceChain: allChainSteps });
   const extractedAPIs =
     apiEvidence.length > 0
       ? JSON.stringify(apiEvidence.slice(0, 30), null, 2)

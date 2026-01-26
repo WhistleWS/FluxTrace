@@ -272,15 +272,42 @@ function getVuexSource(projectRoot, vuexInfo) {
     return null;
 }
 
-function findBindingInParent(parentFullPath, childClassName, propName) {
-    const content = fs.readFileSync(parentFullPath, 'utf-8');
-    const { descriptor } = parse(content);
+function findBindingInParent(parentFullPath, childClassName, propName, sfcCache = null) {
+    let content, descriptor, templateAST;
+
+    // 🆕 优先使用缓存
+    if (sfcCache && sfcCache.has(parentFullPath)) {
+        const cached = sfcCache.get(parentFullPath);
+        content = cached.fileContent;
+        descriptor = cached.parsed.descriptor;
+        templateAST = cached.parsed.templateAST;
+    } else {
+        // 缓存未命中：解析文件
+        content = fs.readFileSync(parentFullPath, 'utf-8');
+        const parseResult = parse(content);
+        descriptor = parseResult.descriptor;
+        if (!descriptor.template) return null;
+        templateAST = baseParse(descriptor.template.content);
+
+        // 🆕 写入缓存供后续使用
+        if (sfcCache) {
+            sfcCache.set(parentFullPath, {
+                parsed: {
+                    descriptor,
+                    templateAST,
+                    kind: 'vue3',
+                    getNodeSource: (node) => node.loc?.source || '',
+                },
+                fileContent: content,
+            });
+        }
+    }
+
     if (!descriptor.template) return null;
 
-    const templateAST = baseParse(descriptor.template.content);
     const templateStartLine = descriptor.template.loc.start.line;
     const kebabChildTag = childClassName.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-    
+
     let binding = null;
     function walk(node) {
         if (binding) return;
@@ -384,118 +411,4 @@ function findMutationTriggers(projectRoot, mutationName, moduleName) {
     }
 }
 
-/**
- * 智能变量优先级排序
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * 🎯 核心功能：按业务重要性对变量进行排序，确保最重要的变量优先被追踪
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * 📊 优先级权重表：
- *
- *   类型          │ 权重 │ 说明
- *   ─────────────┼──────┼─────────────────────────────
- *   content      │  3   │ {{ 插值 }}，用户直接看到的内容
- *   attributes   │  2   │ :value、v-model 等数据绑定
- *   (样式/事件)  │ 1.5  │ :class、:style、@click 等
- *   conditionals │  1   │ v-if、v-show 条件控制
- *
- * 📝 使用场景：
- *
- *   用户点击：<div :class="containerClass">{{ amount }}</div>
- *
- *   变量提取结果：
- *   - amount (content) → 权重 3
- *   - containerClass (:class) → 权重 1.5（样式指令降权）
- *
- *   排序后：['amount', 'containerClass']
- *   → 优先追踪 amount，因为它是用户直接看到的内容
- *
- * @param {Object} categorizedVars - 三维度分类的变量对象
- * @param {Array} categorizedVars.content - 插值表达式变量
- * @param {Array} categorizedVars.attributes - 属性绑定变量
- * @param {Array} categorizedVars.conditionals - 条件指令变量
- * @returns {Array<string>} 按优先级降序排列的变量名列表
- */
-function rankVariablesByPriority(categorizedVars) {
-  // ranked 数组：收集所有变量及其权重信息
-  // 结构：[{ name: 'amount', weight: 3, source: 'content' }, ...]
-  const ranked = [];
-
-  // 权重配置：数值越大优先级越高
-  const weights = { content: 3, attributes: 2, conditionals: 1 };
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 低优先级指令列表
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 这些指令通常不涉及核心业务数据，权重降为 1.5
-  // 例如：:class="isActive" 中的 isActive 只是样式控制，不是核心数据
-  const LOW_PRIORITY_DIRECTIVES = [':class', ':style', '@click', '@change', 'v-on'];
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // Step 1: 提取 content 变量（最高优先级 - 权重 3）
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // content 是 {{ 插值 }} 中的变量，用户直接看到的内容
-  // 例如：<span>{{ userName }}</span> 中的 userName
-  (categorizedVars.content || []).forEach(item => {
-    (item.variables || []).forEach(v => {
-      ranked.push({ name: v, weight: weights.content, source: 'content' });
-    });
-  });
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // Step 2: 提取 attributes 变量（中优先级 - 权重 2 或 1.5）
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // attributes 是属性绑定中的变量
-  // - 数据绑定（:value、v-model）→ 权重 2
-  // - 样式/事件绑定（:class、@click）→ 权重 1.5（降权）
-  (categorizedVars.attributes || []).forEach(item => {
-    // 检查是否是低优先级指令（样式/事件类）
-    const isLowPriority = LOW_PRIORITY_DIRECTIVES.some(d =>
-      item.directive && item.directive.startsWith(d)
-    );
-    // 样式/事件指令降权到 1.5，其他保持 2
-    const weight = isLowPriority ? 1.5 : weights.attributes;
-
-    (item.variables || []).forEach(v => {
-      ranked.push({ name: v, weight, source: 'attribute', directive: item.directive });
-    });
-  });
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // Step 3: 提取 conditionals 变量（低优先级 - 权重 1）
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // conditionals 是条件指令中的变量（v-if、v-show）
-  // 例如：<div v-if="isVisible"> 中的 isVisible
-  // 条件变量通常是控制显隐的标志位，不是核心业务数据
-  (categorizedVars.conditionals || []).forEach(item => {
-    (item.variables || []).forEach(v => {
-      ranked.push({ name: v, weight: weights.conditionals, source: 'conditional' });
-    });
-  });
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // Step 4: 去重 + 按权重降序排序
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 同一变量可能出现在多个位置（如同时在 content 和 attributes 中）
-  // 使用 Map 去重，保留权重最高的那个
-  //
-  // 例如：<div :data-amount="amount">{{ amount }}</div>
-  // - amount 在 content 中（权重 3）
-  // - amount 在 attributes 中（权重 2）
-  // → 保留权重 3 的版本
-  const uniqueMap = new Map();
-  ranked.forEach(item => {
-    if (!uniqueMap.has(item.name) || uniqueMap.get(item.name).weight < item.weight) {
-      uniqueMap.set(item.name, item);
-    }
-  });
-
-  // 按权重降序排序，返回变量名数组
-  // 结果示例：['amount', 'containerClass', 'isVisible']
-  return Array.from(uniqueMap.values())
-    .sort((a, b) => b.weight - a.weight)
-    .map(item => item.name);
-}
-
-module.exports = { isFromProps, findBindingInParent, findVuexDefinition, getVuexSource, findMutationTriggers, rankVariablesByPriority };
+module.exports = { isFromProps, findBindingInParent, findVuexDefinition, getVuexSource, findMutationTriggers };

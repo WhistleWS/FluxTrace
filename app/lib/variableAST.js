@@ -119,38 +119,48 @@ function extractFromProps(node, isVue3) {
         }
     } else {
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // Vue2：动态表达式在 attrsList.value
+        // Vue2：优先使用 rawAttrsMap，回退到 attrsList
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if (node.attrsList) {
-            node.attrsList.forEach(attr => {
-                if (!attr || typeof attr.name !== 'string') return;
+        // 📝 Vue2 的 vue-template-compiler 会在编译时处理动态属性，
+        // 导致 attrsList 可能为空，但 rawAttrsMap 保留了原始属性信息
 
-                const { name, value } = attr;
+        let attrsToProcess = [];
 
-                // 判断是否为动态绑定（以 : @ v- 开头）
-                const isDynamic =
-                    name.startsWith(':') ||        // :class="xxx"
-                    name.startsWith('v-bind:') ||  // v-bind:class="xxx"
-                    name.startsWith('@') ||        // @click="xxx"
-                    name.startsWith('v-on:') ||    // v-on:click="xxx"
-                    name.startsWith('v-');         // v-model, v-if 等
-
-                if (!isDynamic || !value) return;
-
-                // v-for 特殊处理：只提取数据源，不提取别名
-                if (name === 'v-for') {
-                    // "item in userList" -> 提取 "userList"
-                    // "(item, index) in userList" -> 提取 "userList"
-                    const parts = value.split(/\s+(?:in|of)\s+/);
-                    const sourceExpr = parts.length > 1 ? parts[parts.length - 1] : value;
-                    extractIdentifiers(sourceExpr).forEach(id => identifiers.add(id));
-                    return;
-                }
-
-                // 其他指令：直接提取表达式中的变量
-                extractIdentifiers(value).forEach(id => identifiers.add(id));
-            });
+        // 优先使用 rawAttrsMap（保留完整信息）
+        if (node.rawAttrsMap && Object.keys(node.rawAttrsMap).length > 0) {
+            attrsToProcess = Object.values(node.rawAttrsMap);
+        } else if (node.attrsList && node.attrsList.length > 0) {
+            attrsToProcess = node.attrsList;
         }
+
+        attrsToProcess.forEach(attr => {
+            if (!attr || typeof attr.name !== 'string') return;
+
+            const { name, value } = attr;
+
+            // 判断是否为动态绑定（以 : @ v- 开头）
+            const isDynamic =
+                name.startsWith(':') ||        // :class="xxx"
+                name.startsWith('v-bind:') ||  // v-bind:class="xxx"
+                name.startsWith('@') ||        // @click="xxx"
+                name.startsWith('v-on:') ||    // v-on:click="xxx"
+                name.startsWith('v-');         // v-model, v-if 等
+
+            if (!isDynamic || !value) return;
+
+            // v-for 特殊处理：只提取数据源，不提取别名
+            if (name === 'v-for') {
+                // "item in userList" -> 提取 "userList"
+                // "(item, index) in userList" -> 提取 "userList"
+                const parts = value.split(/\s+(?:in|of)\s+/);
+                const sourceExpr = parts.length > 1 ? parts[parts.length - 1] : value;
+                extractIdentifiers(sourceExpr).forEach(id => identifiers.add(id));
+                return;
+            }
+
+            // 其他指令：直接提取表达式中的变量
+            extractIdentifiers(value).forEach(id => identifiers.add(id));
+        });
     }
 
     return identifiers;
@@ -555,41 +565,53 @@ function extractAttributeVariables(node, isVue3) {
             });
         }
     } else {
-        // Vue2：动态属性在 node.attrsList
-        if (node.attrsList) {
-            node.attrsList.forEach(attr => {
-                if (!attr || typeof attr.name !== 'string') return;
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Vue2：优先使用 rawAttrsMap，回退到 attrsList
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 📝 Vue2 的 vue-template-compiler 会在编译时处理动态属性，
+        // 导致 attrsList 可能为空，但 rawAttrsMap 保留了原始属性信息
 
-                const { name, value } = attr;
+        let attrsToProcess = [];
 
-                // 跳过条件指令
-                if (CONDITIONAL_DIRECTIVES.includes(name)) return;
-                // 跳过 v-for
-                if (name === 'v-for') return;
-                // 跳过静态属性
-                if (!value) return;
-
-                // 判断是否为动态绑定
-                const isDynamic =
-                    name.startsWith(':') ||
-                    name.startsWith('v-bind:') ||
-                    name.startsWith('@') ||
-                    name.startsWith('v-on:') ||
-                    name === 'v-model' ||
-                    (name.startsWith('v-') && !CONDITIONAL_DIRECTIVES.includes(name));
-
-                if (!isDynamic) return;
-
-                const variables = extractIdentifiers(value);
-                const resolvedVars = variables.map(v => resolveVariableSource(node, v));
-
-                attrVars.push({
-                    directive: name,
-                    expression: value,
-                    variables: [...new Set(resolvedVars)]
-                });
-            });
+        // 优先使用 rawAttrsMap（保留完整信息）
+        if (node.rawAttrsMap && Object.keys(node.rawAttrsMap).length > 0) {
+            attrsToProcess = Object.values(node.rawAttrsMap);
+        } else if (node.attrsList && node.attrsList.length > 0) {
+            attrsToProcess = node.attrsList;
         }
+
+        attrsToProcess.forEach(attr => {
+            if (!attr || typeof attr.name !== 'string') return;
+
+            const { name, value } = attr;
+
+            // 跳过条件指令
+            if (CONDITIONAL_DIRECTIVES.includes(name)) return;
+            // 跳过 v-for
+            if (name === 'v-for') return;
+            // 跳过静态属性
+            if (!value) return;
+
+            // 判断是否为动态绑定
+            const isDynamic =
+                name.startsWith(':') ||
+                name.startsWith('v-bind:') ||
+                name.startsWith('@') ||
+                name.startsWith('v-on:') ||
+                name === 'v-model' ||
+                (name.startsWith('v-') && !CONDITIONAL_DIRECTIVES.includes(name));
+
+            if (!isDynamic) return;
+
+            const variables = extractIdentifiers(value);
+            const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+            attrVars.push({
+                directive: name,
+                expression: value,
+                variables: [...new Set(resolvedVars)]
+            });
+        });
     }
 
     return attrVars;
