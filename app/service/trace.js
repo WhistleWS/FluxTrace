@@ -114,7 +114,6 @@ const {
   findVuexDefinition,
   getVuexSource,
   findMutationTriggers,
-  rankVariablesByPriority,
 } = require('../lib/utils/traceUtils');
 const { parseSfcTemplate, normalizeLineColumn } = require('../lib/sfcTemplate');
 
@@ -128,7 +127,67 @@ const { parseSfcTemplate, normalizeLineColumn } = require('../lib/sfcTemplate');
  */
 const MAX_TRACE_DEPTH = 10;
 
+/**
+ * 变量分类类型
+ */
+const CATEGORY_TYPES = ['content', 'attributes', 'conditionals'];
+
+/**
+ * 分类显示名称映射
+ */
+const CATEGORY_LABELS = {
+  content: '📊 内容变量追踪链 (content)',
+  attributes: '🎨 属性变量追踪链 (attributes)',
+  conditionals: '🔀 条件变量追踪链 (conditionals)',
+};
+
 class TraceService extends Service {
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // SFC 缓存机制
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /**
+   * 带缓存的 SFC 解析
+   *
+   * 📝 设计说明：
+   * 多链路追踪时，同一个父组件可能被多个分类链路访问，导致重复解析。
+   * 通过请求级缓存，确保每个文件在单次请求中只解析一次。
+   *
+   * 📊 性能提升示例：
+   *   用户点击元素有 3 个变量，都来自 props，追踪链深度 = 3
+   *   优化前：13 次解析（每个分类每层都解析）
+   *   优化后：3 次解析（每个文件只解析一次）
+   *
+   * @param {string} fullPath - 文件绝对路径
+   * @param {Map} cache - 请求级缓存 Map<absolutePath, {parsed, fileContent}>
+   * @param {Object} parseOptions - 解析选项
+   * @param {string} parseOptions.projectRoot - 项目根目录
+   * @param {string} parseOptions.filename - 相对文件名
+   * @returns {Object} { parsed, fileContent }
+   */
+  getCachedParsedSfc(fullPath, cache, parseOptions) {
+    // 缓存命中：直接返回
+    if (cache.has(fullPath)) {
+      this.ctx.logger.info(`[SFC Cache] HIT: ${path.basename(fullPath)}`);
+      return cache.get(fullPath);
+    }
+
+    // 缓存未命中：解析文件并缓存
+    this.ctx.logger.info(`[SFC Cache] MISS: ${path.basename(fullPath)}`);
+
+    const fileContent = fs.readFileSync(fullPath, 'utf-8');
+    const parsed = parseSfcTemplate({
+      projectRoot: parseOptions.projectRoot,
+      fileContent,
+      filename: parseOptions.filename,
+    });
+
+    const cacheEntry = { parsed, fileContent };
+    cache.set(fullPath, cacheEntry);
+
+    return cacheEntry;
+  }
+
   /**
    * 分析入口：从用户点击位置溯源到数据源头，并调用大模型生成结构化分析
    * @param {Object} params
@@ -155,370 +214,194 @@ class TraceService extends Service {
     // 项目根目录（用于拼接完整路径）
     const projectRoot = app.config.projectRoot;
 
-    // 追踪链：记录从子组件到父组件的完整追踪路径
-    const traceChain = [];
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 1: 读取并解析 Vue 文件
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const fullPath = path.join(projectRoot, currentRelativePath);
+    if (!fs.existsSync(fullPath)) {
+      return { message: '文件不存在', path: currentRelativePath };
+    }
 
-    // 当前追踪的位置（会随着向上追踪而改变）
+    const fileContent = fs.readFileSync(fullPath, 'utf-8');
+
+    // 当前追踪的位置
     let currentLine = Number.isFinite(line) ? line : NaN;
     let currentColumn = Number.isFinite(column) ? column : NaN;
 
-    // 迭代计数器（防止无限循环）
-    let iteration = 0;
-
     /**
-     * 调用片段传递机制
+     * 坐标规范化
      *
-     * 📝 场景：子组件的变量来自 props，需要追踪到父组件
-     *
-     * 当我们在父组件中找到 <ChildComponent :amount="xxx" /> 时，
-     * 需要把这段代码保存下来，在下一轮迭代中作为 callSnippet 展示。
-     *
-     * 这样 AI 就能看到完整的数据流：
-     * 父组件的 xxx -> 子组件的 props.amount -> 子组件模板中的 {{ amount }}
+     * 📝 问题：用户点击可能落在行尾空白处
+     * 解决：把 column 限制到本行最后一个非空白字符
      */
-    let nextCallSnippet = '';
+    const normalized = normalizeLineColumn(fileContent, currentLine, currentColumn);
+    currentLine = normalized.line;
+    currentColumn = normalized.column;
 
-    while (currentRelativePath && iteration < MAX_TRACE_DEPTH) {
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 1: 读取并解析 Vue 文件
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      const fullPath = path.join(projectRoot, currentRelativePath);
-      if (!fs.existsSync(fullPath)) break;
-
-      const fileContent = fs.readFileSync(fullPath, 'utf-8');
-
-      /**
-       * 坐标规范化
-       *
-       * 📝 问题：用户点击可能落在行尾空白处
-       * 解决：把 column 限制到本行最后一个非空白字符
-       */
-      const normalized = normalizeLineColumn(fileContent, currentLine, currentColumn);
-      currentLine = normalized.line;
-      currentColumn = normalized.column;
-
-      // 解析 Vue SFC（单文件组件）
-      const parsed = parseSfcTemplate({
-        projectRoot,
-        fileContent,
-        filename: currentRelativePath,
-      });
-      if (!parsed || !parsed.descriptor || !parsed.descriptor.template) break;
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 2: 定位模板中的目标节点
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      let targetNode = null;
-
-      if (parsed.kind === 'vue3') {
-        /**
-         * Vue3 坐标转换
-         *
-         * Vue3 的 template AST 行号是相对于 <template> 标签内部的
-         * 需要从文件行号减去 template 的起始行号
-         *
-         * 示例：
-         *   <template>     <- 第 10 行 (descriptor.template.loc.start.line)
-         *     <div>        <- 第 11 行 (文件) = 第 2 行 (template 内)
-         */
-        const templateStartLine = parsed.descriptor.template.loc.start.line;
-        const targetLineInTemplate = currentLine - templateStartLine + 1;
-        targetNode = findNodeInTemplate(parsed.templateAST, targetLineInTemplate, currentColumn);
-      } else {
-        /**
-         * Vue2 坐标转换
-         *
-         * Vue2 的处理更复杂，因为 component-compiler-utils 会对模板做 de-indent
-         * （去除公共缩进），导致列号需要额外调整
-         *
-         * 步骤：
-         * 1. fileLine -> templateLine（减去 template 起始行）
-         * 2. fileColumn -> templateColumn（减去公共缩进）
-         * 3. 再次 normalize（防止越界）
-         */
-        const templateLine = currentLine - parsed.templateStartLoc.line + 1;
-        const columnAdjusted = Math.max(0, currentColumn - (parsed.templateBaseIndent || 0));
-        const templateNormalized = normalizeLineColumn(parsed.templateSource, templateLine, columnAdjusted);
-
-        targetNode = findNodeInTemplate(
-          parsed.templateAST,
-          templateNormalized.line,
-          templateNormalized.column,
-          null,
-          parsed.templateSource
-        );
-      }
-
-      // 没找到目标节点，终止追踪
-      if (!targetNode) break;
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 3: 提取变量（三维度分类）
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      const categorizedVars = getCategorizedVariables(targetNode);
-      const entryVars = categorizedVars.all; // 使用扁平列表，向后兼容
-
-      /**
-       * 静态内容检测
-       *
-       * 如果没有提取到任何变量，说明用户点击的是写死的静态文本
-       * 例如：<span>Alipay</span>
-       *
-       * 这种情况直接返回结果，不需要追踪和 AI 分析
-       */
-      if (entryVars.length === 0) {
-        const staticSource = parsed.getNodeSource(targetNode);
-        return this.buildStaticContentResult(currentRelativePath, targetNode.tag, staticSource);
-      }
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 4: 代码提纯
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      const rawScript = parsed.descriptor.scriptSetup?.content || parsed.descriptor.script?.content || '';
-      const prunedScript = pruneScript(rawScript, entryVars);
-
-      // 构建当前层级的追踪信息
-      const stepInfo = {
-        file: currentRelativePath,
-        tag: targetNode.tag,
-        prunedScript,
-        source: parsed.getNodeSource(targetNode),
-        callSnippet: nextCallSnippet,  // 来自上一层的调用片段
-        categorizedVars,  // 新增：三维度分类变量
-      };
-
-      // 清空调用片段（已被当前层级消费）
-      nextCallSnippet = '';
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 5: 判断是否需要继续向上追踪（props 溯源 - 优化版）
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      /**
-       * Props 溯源逻辑（优化版）
-       *
-       * ═══════════════════════════════════════════════════════════════════════════
-       * 🎯 优化目标：解决只检查第一个变量导致追踪链不完整的问题
-       * ═══════════════════════════════════════════════════════════════════════════
-       *
-       * 📝 问题场景：
-       *
-       *   用户点击：<div :class="staticClass">{{ amount }}</div>
-       *
-       *   旧逻辑：entryVars = ['staticClass', 'amount']
-       *          只检查 entryVars[0] = 'staticClass'
-       *          如果 staticClass 不是 props → 停止追踪 ❌
-       *          但 amount 可能是 props，应该继续追踪！
-       *
-       *   新逻辑：
-       *   1. 按优先级排序：['amount'(权重3), 'staticClass'(权重1.5)]
-       *   2. 遍历找出所有 props 变量
-       *   3. 选择优先级最高的 props 变量追踪 ✓
-       *
-       * ═══════════════════════════════════════════════════════════════════════════
-       *
-       * 如果变量来自 props，说明数据是父组件传入的
-       * 需要：
-       * 1. 通过 WebpackService 找到父组件
-       * 2. 在父组件中找到调用当前组件的代码
-       * 3. 继续在父组件中追踪
-       */
-
-      // ─────────────────────────────────────────────────────────────
-      // Step 5.1: 智能排序变量
-      // ─────────────────────────────────────────────────────────────
-      // 调用 rankVariablesByPriority 按优先级对变量排序
-      // 优先级：content(3) > attributes(2) > 样式/事件(1.5) > conditionals(1)
-      //
-      // 示例输入：
-      //   categorizedVars = {
-      //     content: [{ variables: ['amount'] }],
-      //     attributes: [{ directive: ':class', variables: ['staticClass'] }]
-      //   }
-      //
-      // 示例输出：
-      //   rankedVars = ['amount', 'staticClass']
-      //   （amount 优先，因为 content 权重 3 > :class 权重 1.5）
-      const rankedVars = rankVariablesByPriority(categorizedVars);
-
-      // ─────────────────────────────────────────────────────────────
-      // Step 5.2: 筛选出所有来自 props 的变量
-      // ─────────────────────────────────────────────────────────────
-      // 遍历排序后的变量，调用 isFromProps() 检查每个变量是否在 props 中定义
-      //
-      // 示例：
-      //   rankedVars = ['amount', 'staticClass', 'localData']
-      //   - amount: isFromProps() → true  (在 props 中)
-      //   - staticClass: isFromProps() → true  (在 props 中)
-      //   - localData: isFromProps() → false (在 data 中)
-      //
-      //   结果：propsVars = ['amount', 'staticClass']
-      const propsVars = rankedVars.filter(v => isFromProps(rawScript, v));
-
-      let shouldContinue = false;
-      let primaryVar = null;
-
-      // ─────────────────────────────────────────────────────────────
-      // Step 5.3: 选择优先级最高的 props 变量进行追踪
-      // ─────────────────────────────────────────────────────────────
-      // 如果存在来自 props 的变量，选择第一个（优先级最高）进行追踪
-      // 保持单链路追踪架构，向后兼容
-      if (propsVars.length > 0) {
-        // propsVars 已按优先级排序，取第一个即为最重要的 props 变量
-        primaryVar = propsVars[0];
-
-        // 查找引用当前组件的父组件（通过 Webpack 依赖图）
-        const parents = webpackService.getParents(currentRelativePath);
-
-        if (parents.length > 0) {
-          const parentRelativePath = parents[0];
-          const parentFullPath = path.resolve(projectRoot, parentRelativePath);
-          // 获取当前组件的类名（用于在父组件模板中查找）
-          const childClassName = path.basename(currentRelativePath, '.vue');
-
-          // ─────────────────────────────────────────────────────────────
-          // Step 5.4: 在父组件中查找 prop 绑定
-          // ─────────────────────────────────────────────────────────────
-          // 在父组件模板中查找类似 <ChartCard :amount="xxx" /> 的代码
-          // 返回 binding 对象包含：
-          // - variable: 绑定的表达式（如 'totalAmount'）
-          // - line/column: 在父组件中的位置
-          // - rawTag: 完整的组件调用代码
-          const binding = findBindingInParent(parentFullPath, childClassName, primaryVar);
-
-          if (binding) {
-            // 保存调用片段，供下一轮迭代使用
-            // 这样 AI 就能看到父子组件间的数据传递关系
-            nextCallSnippet = binding.rawTag;
-
-            // 更新追踪位置到父组件，继续下一轮迭代
-            currentRelativePath = parentRelativePath;
-            currentLine = binding.line;
-            currentColumn = binding.column;
-            shouldContinue = true;
-          }
-        }
-      }
-
-      // ─────────────────────────────────────────────────────────────
-      // Step 5.5: 记录 props 分析结果（用于调试和扩展）
-      // ─────────────────────────────────────────────────────────────
-      // 将分析信息附加到 stepInfo，方便：
-      // 1. 调试：查看哪些变量被识别为 props
-      // 2. 扩展：未来可能需要追踪多个 props 变量
-      stepInfo.propsAnalysis = {
-        allPropsVars: propsVars,        // 所有来自 props 的变量（按优先级排序）
-        primaryTrackedVar: primaryVar,   // 实际被追踪的变量
-      };
-
-      // 当前层级信息入栈
-      traceChain.push(stepInfo);
-
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Phase 6: Vuex 数据溯源（可选）
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      /**
-       * Vuex 溯源
-       *
-       * 如果变量来自 Vuex（mapState/mapGetters），
-       * 我们还需要追踪到 Store 的定义，找出：
-       * - State/Getter 的具体实现
-       * - 哪些 Mutation 会修改这个 State
-       * - 这些 Mutation 在哪里被触发
-       */
-      const vuexMapping = findVuexDefinition(stepInfo.prunedScript, entryVars);
-
-      if (vuexMapping) {
-        const storeSource = getVuexSource(projectRoot, vuexMapping);
-
-        if (storeSource) {
-          // 构建 Vuex 追踪信息
-          const vuexTraceInfo = this.buildVuexTraceInfo(vuexMapping, storeSource, projectRoot);
-          traceChain.push(vuexTraceInfo);
-
-          // Vuex 通常就是数据源头，终止追踪
-          break;
-        }
-      }
-
-      if (!shouldContinue) break;
-      iteration++;
+    // 解析 Vue SFC（单文件组件）
+    const parsed = parseSfcTemplate({
+      projectRoot,
+      fileContent,
+      filename: currentRelativePath,
+    });
+    if (!parsed || !parsed.descriptor || !parsed.descriptor.template) {
+      return { message: '无法解析 Vue 文件模板', path: currentRelativePath };
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // Phase 7: 构造 AI 分析所需的代码文本
+    // Phase 2: 定位模板中的目标节点
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    let targetNode = null;
+
+    if (parsed.kind === 'vue3') {
+      /**
+       * Vue3 坐标转换
+       *
+       * Vue3 的 template AST 行号是相对于 <template> 标签内部的
+       * 需要从文件行号减去 template 的起始行号
+       */
+      const templateStartLine = parsed.descriptor.template.loc.start.line;
+      const targetLineInTemplate = currentLine - templateStartLine + 1;
+      targetNode = findNodeInTemplate(parsed.templateAST, targetLineInTemplate, currentColumn);
+    } else {
+      /**
+       * Vue2 坐标转换
+       *
+       * Vue2 的处理更复杂，因为 component-compiler-utils 会对模板做 de-indent
+       */
+      const templateLine = currentLine - parsed.templateStartLoc.line + 1;
+      const columnAdjusted = Math.max(0, currentColumn - (parsed.templateBaseIndent || 0));
+      const templateNormalized = normalizeLineColumn(parsed.templateSource, templateLine, columnAdjusted);
+
+      targetNode = findNodeInTemplate(
+        parsed.templateAST,
+        templateNormalized.line,
+        templateNormalized.column,
+        null,
+        parsed.templateSource
+      );
+    }
+
+    // 没找到目标节点，终止追踪
+    if (!targetNode) {
+      return { message: '无法定位目标节点', path: currentRelativePath, line, column };
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 3: 提取变量（三维度分类）
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const categorizedVars = getCategorizedVariables(targetNode);
+    const entryVars = categorizedVars.all; // 使用扁平列表，向后兼容
+
+    /**
+     * 静态内容检测
+     *
+     * 如果没有提取到任何变量，说明用户点击的是写死的静态文本
+     * 例如：<span>Alipay</span>
+     */
+    if (entryVars.length === 0) {
+      const staticSource = parsed.getNodeSource(targetNode);
+      return this.buildStaticContentResult(currentRelativePath, targetNode.tag, staticSource);
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 4: 多链路追踪（核心改动）
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     /**
-     * 为什么要 reverse？
+     * 多链路追踪架构
      *
-     * traceChain 的顺序是：[子组件, 父组件, 祖父组件, ...]
-     * 但对于 AI 分析，我们希望从数据源头开始讲述：
-     * [祖父组件(数据源), 父组件(中转), 子组件(展示)]
+     * 📝 设计说明：
+     * 旧版只追踪一个变量，现在改为对三类变量分别追踪：
+     * - content: {{ 插值 }} 中的变量
+     * - attributes: :prop 绑定中的变量
+     * - conditionals: v-if/v-show 中的变量
      *
-     * 📊 示例：
-     *
-     *   原始顺序（追踪顺序）：
-     *   ChartCard.vue → Dashboard.vue → App.vue
-     *
-     *   反转后（数据流顺序）：
-     *   App.vue → Dashboard.vue → ChartCard.vue
+     * 每类变量独立追踪，最终合并为完整的多链路结果
      */
-    const finalCodeForAI = traceChain
-      .reverse()
-      .map(step => {
-        /**
-         * 构建每个追踪层级的代码片段
-         *
-         * 格式：
-         * // File: src/views/Dashboard.vue
-         * // [Template] 目标 DOM 元素:
-         * <span>{{ amount }}</span>
-         *
-         * // [Data Flow] 模板中调用子组件的代码:
-         * <ChartCard :amount="totalAmount" />
-         *
-         * // [Logic] 关联的脚本逻辑:
-         * computed: { totalAmount() { return this.data.amount } }
-         */
-        let output = `// File: ${step.file}\n`;
-
-        // 添加目标 DOM 元素，让 AI 知道我们在追踪哪个元素
-        if (step.source) {
-          output += `// [Template] 目标 DOM 元素:\n${step.source}\n\n`;
-        }
-
-        // 添加父子组件的调用关系
-        if (step.callSnippet) {
-          output += `// [Data Flow] 模板中调用子组件的代码:\n${step.callSnippet}\n\n`;
-        }
-
-        // 添加关联的脚本逻辑
-        output += `// [Logic] 关联的脚本逻辑:\n${step.prunedScript || '// (该层级无相关脚本逻辑)'}`;
-        return output;
-      })
-      .join('\n\n' + '='.repeat(25) + '\n\n');
+    const rawScript = parsed.descriptor.scriptSetup?.content || parsed.descriptor.script?.content || '';
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // Phase 8: 调用 AI 分析
+    // 🆕 创建请求级 SFC 缓存
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /**
+     * SFC 缓存优化
+     *
+     * 📝 问题：多链路追踪时，同一个父组件可能被多个分类链路访问
+     * 解决：使用请求级缓存，确保每个文件在单次请求中只解析一次
+     *
+     * 📊 缓存结构：Map<absolutePath, {parsed, fileContent}>
+     */
+    const sfcCache = new Map();
+
+    // 缓存初始文件解析结果（避免首次迭代重复解析）
+    sfcCache.set(fullPath, { parsed, fileContent });
+
+    // 构建初始上下文，供 traceCategory 方法复用
+    const initialContext = {
+      relativePath: currentRelativePath,
+      line: currentLine,
+      column: currentColumn,
+      parsed,
+      targetNode,
+      rawScript,
+      sfcCache,  // 🆕 传递缓存
+    };
+
+    // 并行追踪三类变量
+    ctx.logger.info('[多链路追踪] 开始追踪三类变量...');
+    ctx.logger.info(`[分类变量] content: ${categorizedVars.content.length}, attributes: ${categorizedVars.attributes.length}, conditionals: ${categorizedVars.conditionals.length}`);
+
+    const traceChains = {
+      content: await this.traceCategory('content', categorizedVars.content, initialContext),
+      attributes: await this.traceCategory('attributes', categorizedVars.attributes, initialContext),
+      conditionals: await this.traceCategory('conditionals', categorizedVars.conditionals, initialContext),
+    };
+
+    ctx.logger.info('[多链路追踪] 追踪完成', {
+      contentDepth: traceChains.content.length,
+      attributesDepth: traceChains.attributes.length,
+      conditionalsDepth: traceChains.conditionals.length,
+    });
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 5: 构造多链路 AI 分析输入
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /**
+     * 使用 buildMultiChainPrompt 构造 AI 输入
+     *
+     * 格式示例：
+     * ### 📊 内容变量追踪链 (content)
+     * // File: ChartCard.vue
+     * // [Template] 目标 DOM 元素: <span>{{ amount }}</span>
+     * ...
+     *
+     * ### 🎨 属性变量追踪链 (attributes)
+     * // File: ChartCard.vue
+     * ...
+     */
+    const finalCodeForAI = this.buildMultiChainPrompt(traceChains);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 6: 调用 AI 分析
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     /**
      * AI 分析流程
      *
      * 把追踪到的代码片段发送给大模型，让它：
-     * 1. 理解数据的完整流转路径
-     * 2. 识别数据源类型（API/Vuex/静态）
+     * 1. 理解数据的完整流转路径（三条链路）
+     * 2. 识别每条链路的数据源类型（API/Vuex/静态）
      * 3. 生成结构化的分析报告
      */
-    const finalTrace = [...traceChain].reverse();
-    const originalTargetElement = finalTrace[0]?.source || '未知元素';
+    const originalTargetElement = parsed.getNodeSource(targetNode) || '未知元素';
 
-    ctx.logger.info('--- 启动 AI 智能逻辑分析 ---');
+    ctx.logger.info('--- 启动 AI 智能逻辑分析（多链路模式） ---');
     ctx.logger.info(`[点击元素] ${originalTargetElement}`);
 
     // 调用 LLM 服务进行智能分析
     const aiAnalysis = await ctx.service.llm.analyze({
       finalCodeForAI,
       targetElement: originalTargetElement,
-      traceChain: finalTrace,
+      traceChains,  // 传递多链路结构
     });
 
     // 在结果中追加点击元素信息，方便用户区分多次点击的结果
@@ -532,30 +415,254 @@ class TraceService extends Service {
     ctx.logger.info(enrichedAnalysis);
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // Phase 9: 构造最终返回结果
+    // Phase 7: 构造最终返回结果（多链路版本）
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     /**
-     * 返回结构说明
+     * 返回结构说明（多链路版本）
      *
      * @returns {Object} 分析结果
      * @property {string} message - 状态消息
      * @property {string} targetElement - 用户点击的 DOM 元素源码
-     * @property {Array} traceChain - 完整的追踪链
+     * @property {Object} traceChains - 三条追踪链（content/attributes/conditionals）
      * @property {Object} aiAnalysis - AI 生成的分析报告
      * @property {string} finalCodeForAI - 发送给 AI 的代码文本
+     * @property {Object} categorizedVars - 分类后的变量信息
      */
     return {
       message: '分析成功',
       targetElement: originalTargetElement,
-      traceChain,
+      traceChains,  // 新结构：三条独立追踪链
       aiAnalysis: enrichedAnalysis,
       finalCodeForAI,
+      categorizedVars,  // 附加分类变量信息，方便前端展示
     };
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 辅助方法
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /**
+   * 追踪单个分类的变量链路
+   *
+   * 📝 核心方法：将现有的 while 循环追踪逻辑抽象为可复用的函数
+   *
+   * @param {string} category - 分类名称 ('content'|'attributes'|'conditionals')
+   * @param {Array} categoryVars - 该分类下的变量列表
+   * @param {Object} initialContext - 初始追踪上下文
+   * @param {string} initialContext.relativePath - 起始文件相对路径
+   * @param {number} initialContext.line - 起始行号
+   * @param {number} initialContext.column - 起始列号
+   * @param {Object} initialContext.targetNode - 目标 AST 节点
+   * @param {Object} initialContext.parsed - 解析后的 SFC 对象
+   * @param {string} initialContext.rawScript - 原始脚本内容
+   * @returns {Array} 该分类的追踪链
+   *
+   * 📊 示例：
+   *
+   *   traceCategory('content', [{ variables: ['amount'] }], {...})
+   *   返回：[
+   *     { file: 'ChartCard.vue', tag: 'span', ... },
+   *     { file: 'Dashboard.vue', tag: 'ChartCard', ... }
+   *   ]
+   */
+  async traceCategory(category, categoryVars, initialContext) {
+    const { app } = this;
+    const projectRoot = app.config.projectRoot;
+    const chain = [];
+
+    // 🆕 获取请求级 SFC 缓存（跨链路复用）
+    const sfcCache = initialContext.sfcCache || new Map();
+
+    // 提取该分类下所有变量名
+    const varNames = categoryVars.flatMap(item => item.variables || []);
+    if (varNames.length === 0) return chain;
+
+    // 初始化追踪状态
+    let currentRelativePath = initialContext.relativePath;
+    let currentLine = initialContext.line;
+    let currentColumn = initialContext.column;
+    let nextCallSnippet = '';
+    let iteration = 0;
+
+    // 首次迭代使用传入的上下文
+    let useInitialContext = true;
+
+    while (currentRelativePath && iteration < MAX_TRACE_DEPTH) {
+      let parsed, targetNode, rawScript, fileContent;
+
+      if (useInitialContext) {
+        // 首次迭代：使用传入的已解析上下文
+        parsed = initialContext.parsed;
+        targetNode = initialContext.targetNode;
+        rawScript = initialContext.rawScript;
+        useInitialContext = false;
+      } else {
+        // 🆕 后续迭代：使用缓存解析（避免重复解析同一文件）
+        const fullPath = path.join(projectRoot, currentRelativePath);
+        if (!fs.existsSync(fullPath)) break;
+
+        // 使用缓存获取解析结果
+        const cached = this.getCachedParsedSfc(fullPath, sfcCache, {
+          projectRoot,
+          filename: currentRelativePath,
+        });
+
+        parsed = cached.parsed;
+        fileContent = cached.fileContent;
+
+        if (!parsed || !parsed.descriptor || !parsed.descriptor.template) break;
+
+        // 坐标规范化
+        const normalized = normalizeLineColumn(fileContent, currentLine, currentColumn);
+        currentLine = normalized.line;
+        currentColumn = normalized.column;
+
+        // 定位节点
+        if (parsed.kind === 'vue3') {
+          const templateStartLine = parsed.descriptor.template.loc.start.line;
+          const targetLineInTemplate = currentLine - templateStartLine + 1;
+          targetNode = findNodeInTemplate(parsed.templateAST, targetLineInTemplate, currentColumn);
+        } else {
+          const templateLine = currentLine - parsed.templateStartLoc.line + 1;
+          const columnAdjusted = Math.max(0, currentColumn - (parsed.templateBaseIndent || 0));
+          const templateNormalized = normalizeLineColumn(parsed.templateSource, templateLine, columnAdjusted);
+          targetNode = findNodeInTemplate(
+            parsed.templateAST,
+            templateNormalized.line,
+            templateNormalized.column,
+            null,
+            parsed.templateSource
+          );
+        }
+
+        if (!targetNode) break;
+
+        rawScript = parsed.descriptor.scriptSetup?.content || parsed.descriptor.script?.content || '';
+      }
+
+      // 代码提纯：只保留与当前分类变量相关的代码
+      const prunedScript = pruneScript(rawScript, varNames);
+
+      // 构建当前层级信息
+      const stepInfo = {
+        file: currentRelativePath,
+        tag: targetNode.tag,
+        category,
+        tracedVariables: varNames,
+        prunedScript,
+        source: parsed.getNodeSource(targetNode),
+        callSnippet: nextCallSnippet,
+      };
+
+      nextCallSnippet = '';
+
+      // 检查是否需要继续向上追踪（props 溯源）
+      const propsVars = varNames.filter(v => isFromProps(rawScript, v));
+      let shouldContinue = false;
+
+      if (propsVars.length > 0) {
+        const primaryVar = propsVars[0];
+        const parents = webpackService.getParents(currentRelativePath);
+
+        if (parents.length > 0) {
+          const parentRelativePath = parents[0];
+          const parentFullPath = path.resolve(projectRoot, parentRelativePath);
+          const childClassName = path.basename(currentRelativePath, '.vue');
+          // 🆕 传递 sfcCache 给 findBindingInParent，避免重复解析父组件
+          const binding = findBindingInParent(parentFullPath, childClassName, primaryVar, sfcCache);
+
+          if (binding) {
+            nextCallSnippet = binding.rawTag;
+            currentRelativePath = parentRelativePath;
+            currentLine = binding.line;
+            currentColumn = binding.column;
+            shouldContinue = true;
+
+            // 更新要追踪的变量为父组件中的绑定变量
+            varNames.length = 0;
+            varNames.push(binding.variable);
+          }
+        }
+      }
+
+      chain.push(stepInfo);
+
+      // Vuex 检测（仅对当前分类变量）
+      const vuexMapping = findVuexDefinition(prunedScript, varNames);
+      if (vuexMapping) {
+        const storeSource = getVuexSource(projectRoot, vuexMapping);
+        if (storeSource) {
+          const vuexTraceInfo = this.buildVuexTraceInfo(vuexMapping, storeSource, projectRoot);
+          vuexTraceInfo.category = category;
+          chain.push(vuexTraceInfo);
+          break;
+        }
+      }
+
+      if (!shouldContinue) break;
+      iteration++;
+    }
+
+    return chain;
+  }
+
+  /**
+   * 构造多链路 AI 提示词
+   *
+   * 📝 将三条追踪链格式化为 AI 可理解的文本
+   *
+   * @param {Object} traceChains - 多链路追踪结果
+   * @param {Array} traceChains.content - 内容变量追踪链
+   * @param {Array} traceChains.attributes - 属性变量追踪链
+   * @param {Array} traceChains.conditionals - 条件变量追踪链
+   * @returns {string} 格式化后的 AI 输入文本
+   */
+  buildMultiChainPrompt(traceChains) {
+    let output = '';
+
+    for (const category of CATEGORY_TYPES) {
+      const chain = traceChains[category];
+      if (!chain || chain.length === 0) continue;
+
+      output += `\n### ${CATEGORY_LABELS[category]}\n`;
+      output += this.formatChainForAI(chain);
+      output += '\n';
+    }
+
+    return output || '// 未追踪到任何变量链路';
+  }
+
+  /**
+   * 格式化单条追踪链为 AI 可读文本
+   *
+   * @param {Array} chain - 追踪链
+   * @returns {string} 格式化文本
+   */
+  formatChainForAI(chain) {
+    // 反转链路：从数据源到 UI
+    const reversed = [...chain].reverse();
+
+    return reversed.map(step => {
+      let output = `// File: ${step.file}\n`;
+
+      if (step.source) {
+        output += `// [Template] 目标 DOM 元素:\n${step.source}\n\n`;
+      }
+
+      if (step.callSnippet) {
+        output += `// [Data Flow] 模板中调用子组件的代码:\n${step.callSnippet}\n\n`;
+      }
+
+      if (step.tracedVariables && step.tracedVariables.length > 0) {
+        output += `// [Traced Variables] ${step.tracedVariables.join(', ')}\n`;
+      }
+
+      output += `// [Logic] 关联的脚本逻辑:\n${step.prunedScript || '// (该层级无相关脚本逻辑)'}`;
+
+      return output;
+    }).join('\n\n' + '-'.repeat(40) + '\n\n');
+  }
 
   /**
    * 构建静态内容结果

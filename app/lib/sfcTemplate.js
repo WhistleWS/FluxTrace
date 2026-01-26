@@ -1,7 +1,65 @@
 const path = require('path');
 
 /**
- * 这个文件的目标：统一提供 “从 .vue 文件解析出 template AST” 的能力，并兼容 Vue2/Vue3 两套编译器。
+ * 节点源码截断配置
+ */
+const NODE_SOURCE_MAX_LENGTH = 500;  // 最大字符数
+const NODE_SOURCE_MAX_LINES = 10;    // 最大行数
+
+/**
+ * 截断过长的节点源码
+ *
+ * 📝 设计说明：
+ * 对于带 v-for 的容器元素，getNodeSource 会返回整个循环块的内容（可能有几十行）。
+ * 这会导致发送给 AI 的内容过大，触发 token 限制或超时。
+ *
+ * 截断策略：
+ * 1. 如果源码超过最大长度或行数，只保留开标签
+ * 2. 开标签提取方式：找到第一个 > 的位置
+ *
+ * @param {string} source - 原始节点源码
+ * @returns {string} 截断后的源码
+ */
+function truncateNodeSource(source) {
+  if (!source) return '';
+
+  const lines = source.split('\n');
+  const length = source.length;
+
+  // 如果没有超过限制，直接返回
+  if (length <= NODE_SOURCE_MAX_LENGTH && lines.length <= NODE_SOURCE_MAX_LINES) {
+    return source;
+  }
+
+  // 超过限制：只保留开标签
+  // 找到第一个 > 的位置（开标签结束）
+  const firstTagEnd = source.indexOf('>');
+  if (firstTagEnd === -1) {
+    // 没找到 >，返回截断的源码
+    return source.slice(0, NODE_SOURCE_MAX_LENGTH) + '\n  <!-- ... 内容已截断 -->';
+  }
+
+  // 提取开标签
+  const openTag = source.slice(0, firstTagEnd + 1);
+
+  // 检查是否是自闭合标签
+  if (source.slice(firstTagEnd - 1, firstTagEnd + 1) === '/>') {
+    return openTag;
+  }
+
+  // 找到标签名用于生成闭合标签
+  const tagMatch = source.match(/^<([a-zA-Z][-a-zA-Z0-9]*)/);
+  const tagName = tagMatch ? tagMatch[1] : '';
+
+  if (tagName) {
+    return `${openTag}\n  <!-- ... 子节点内容已省略（共 ${lines.length} 行） -->\n</${tagName}>`;
+  }
+
+  return openTag + '\n  <!-- ... 内容已截断 -->';
+}
+
+/**
+ * 这个文件的目标：统一提供 "从 .vue 文件解析出 template AST" 的能力，并兼容 Vue2/Vue3 两套编译器。
  *
  * 背景：
  * - Vue3：@vue/compiler-sfc 解析 SFC，@vue/compiler-core baseParse(template) 得到 AST（节点带 loc）
@@ -118,7 +176,8 @@ function parseVue3Template(fileContent) {
     templateSource,
     templateAST,
     getNodeSource(node) {
-      return node?.loc?.source || '';
+      const source = node?.loc?.source || '';
+      return truncateNodeSource(source);
     },
   };
 }
@@ -178,7 +237,8 @@ function parseVue2Template(fileContent, filename) {
     templateStartLoc,
     getNodeSource(node) {
       if (!node || typeof node.start !== 'number' || typeof node.end !== 'number') return '';
-      return templateSource.slice(node.start, node.end);
+      const source = templateSource.slice(node.start, node.end);
+      return truncateNodeSource(source);
     },
   };
 }

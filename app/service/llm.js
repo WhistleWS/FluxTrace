@@ -160,9 +160,9 @@ class LlmService extends Service {
    * @param {Object} params
    * @param {string} params.finalCodeForAI 提纯后的跨文件代码
    * @param {string} params.targetElement 用户点击的目标 DOM 片段
-   * @param {Array} params.traceChain 溯源链路（用于提示词）
+   * @param {Object} params.traceChains 多链路追踪结果（content/attributes/conditionals）
    */
-  async analyze({ finalCodeForAI, targetElement, traceChain }) {
+  async analyze({ finalCodeForAI, targetElement, traceChains }) {
     if (!shouldBypassCircuit()) {
       return toDegradedAnalysis('LLM_CIRCUIT_OPEN');
     }
@@ -176,9 +176,9 @@ class LlmService extends Service {
       let lastError = null;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
         try {
-          // 注意：runAIAnalysis 内部会进行“结构化解析失败自修复”，这里主要管调用可靠性
+          // 注意：runAIAnalysis 内部会进行"结构化解析失败自修复"，这里主要管调用可靠性
           const result = await withTimeout(
-            Promise.resolve(runAIAnalysis(finalCodeForAI, targetElement, traceChain)),
+            Promise.resolve(runAIAnalysis(finalCodeForAI, targetElement, traceChains)),
             DEFAULT_TIMEOUT_MS
           );
           onCircuitSuccess();
