@@ -13,6 +13,17 @@ const path = require('path');
  *   不能直接得到 template.content 的 offset，需要用“按行换算 + 缩进补偿”。
  */
 
+/** 
+  * 补充：为什么不直接用 Vue3 的 @vue/compiler-core 解析 Vue2？
+  * 1. 语法兼容性：Vue2 包含一些 Vue3 已废弃的语法（如：过滤器 Filter `|`、inline-template 等），
+  *    Vue3 编译器在遇到这些语法时可能报错或解析结果不符合预期。
+  * 2. AST 结构差异：两者的 AST 节点定义（Property Name、Node Types）完全不同。Vue3 引入了大量
+  *    为了静态提升（hoisting）和 PatchFlag 优化的属性，而 Vue2 的 AST 结构相对扁平且简单。
+  * 3. 结果一致性：本工具（FluxTrace）的目标是还原真实的线上运行逻辑。既然 Vue2 项目在构建时
+  *    使用的是 vue-template-compiler，我们必须使用同样的编译器，以确保得到的 AST 结构、
+  *    指令解析顺序与项目实际运行时完全吻合，避免“分析结果”与“实际运行”存在偏差。
+  */
+
 function computeLineStartOffsets(source) {
   const lineStartOffsets = [0];
   for (let i = 0; i < source.length; i++) {
@@ -89,7 +100,7 @@ function getVueMajor(projectRoot) {
     const version = vuePkg && typeof vuePkg.version === 'string' ? vuePkg.version : '';
     const major = parseInt(version.split('.')[0], 10);
     if (Number.isFinite(major)) return major;
-  } catch (e) {}
+  } catch (e) { }
   return null;
 }
 
@@ -136,6 +147,7 @@ function parseVue2Template(fileContent, filename) {
   const templateSource = descriptor.template.content;
   const templateStartOffset = descriptor.template.start;
   const templateEndOffset = descriptor.template.end;
+  // 原始的 template 字符串
   const rawTemplateSource = fileContent.slice(templateStartOffset, templateEndOffset);
 
   let templateBaseIndent = 0;
