@@ -59,7 +59,7 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
     apiEvidence.length > 0
       ? JSON.stringify(apiEvidence.slice(0, 30), null, 2)
       : '未在链路代码中提取到明确的接口调用证据。';
-  // 2. 定义第四层：输出格式 (基于架构文档要求)
+  // 2. 定义第四层：输出格式 (基于架构文档要求 - 三维度变量分析)
   const DataSourceType = z.enum(['API', 'Store', 'Static', 'UNKNOWN']);
   const HttpMethod = z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'UNKNOWN']);
 
@@ -76,9 +76,32 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
         role: z.string().describe("该组件在链路中的作用，如：容器组件/展示组件"),
         dataMapping: z.string().describe("该层发生的变量映射关系，如：res.data -> this.list")
       })),
-      // === 新增字段 ===
+      // === 三维度变量分析（核心新增） ===
+      variableAnalysis: z.object({
+        // 内容变量：{{ }} 插值中的变量
+        content: z.array(z.object({
+          name: z.string().describe("变量名"),
+          apiDependency: z.string().nullable().describe("接口字段依赖路径，如 res.data.user.name；无 API 依赖时为 null"),
+          computeLogic: z.string().describe("取值逻辑描述，如：通过 computed 计算、直接赋值、filter 过滤等"),
+          dataChain: z.string().describe("数据链路，如：API -> Store -> Computed -> Template")
+        })),
+        // 属性变量：:prop、v-model、@event 中的变量
+        attributes: z.array(z.object({
+          name: z.string().describe("属性/变量名"),
+          directive: z.string().describe("指令类型，如 :class, :disabled, v-model, @click"),
+          definition: z.string().describe("定义位置：props / data / computed / methods / store"),
+          source: z.string().describe("数据来源描述")
+        })),
+        // 条件变量：v-if、v-show 中的变量
+        conditionals: z.array(z.object({
+          expression: z.string().describe("完整条件表达式，如 isLogin && hasRole === 'admin'"),
+          dependencies: z.array(z.string()).describe("依赖的变量列表"),
+          dataChain: z.string().describe("条件变量的数据链路"),
+          description: z.string().describe("条件控制逻辑的自然语言描述，如：当用户已登录且为管理员时显示")
+        }))
+      }),
+      // === 保留字段 ===
       confidence: z.number().min(0).max(100).describe("分析置信度 0-100，低于 60 表示信息不足需人工复查"),
-      relatedVariables: z.array(z.string()).describe("涉及的核心变量名列表，如 ['projects', 'loading']"),
       suggestNextStep: z.string().nullable().describe("建议的下一步操作，如：'查看 Vuex store/account 模块定义' 或 null"),
     })
   );
@@ -101,6 +124,10 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
 1. **数据来源**：这个 DOM 元素显示的数据从哪里来？（API / Vuex Store / 静态数据）
 2. **数据流转**：数据是如何从源头流转到这个 DOM 的？经过了哪些变量？
 3. **关键代码**：哪些代码片段决定了这个 DOM 的渲染内容？
+4. **三维度变量分析**（核心要求）：
+   - **内容变量(content)**：分析 {{ }} 插值中的变量，追踪其 API 依赖、取值逻辑、完整数据链路
+   - **属性变量(attributes)**：分析 :prop、v-model、@event 中的变量，说明定义位置和数据来源
+   - **条件变量(conditionals)**：分析 v-if、v-show 中的条件表达式，列出依赖变量和控制逻辑
 
 **注意事项**：
 - 只描述有价值的信息，不要说"链路深度为X层"这种废话
@@ -109,6 +136,7 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
 - 用自然语言描述，像资深工程师给同事解释代码一样
 - 只有在第六层 api_info 中存在真实 URL 证据时，才能确定是 API 数据源
 - confidence 字段：有明确 API/Store 证据时给 80-100，仅靠推测时给 40-60
+- variableAnalysis 的三个维度必须完整填写，即使某个维度为空数组也要保留
 
 # 第四层：输出格式层
 必须严格按照以下 JSON 格式返回：
@@ -116,47 +144,95 @@ async function runAIAnalysis(finalCodeForAI, targetElement, traceChain) {
 
 # 第4.5层：Few-Shot 示例 [重要参考]
 **示例1：API 数据源（高置信度）**
-点击元素：\`<span>用户名插值表达式</span>\`
+点击元素：\`<span>{{{{ userName }}}}</span>\`
 输出：
 \`\`\`json
 {{
-  "fullLinkTrace": "用户名来自 GET /api/user 接口。在 created 钩子中调用 request('/api/user')，响应数据赋值给 this.user，模板通过插值渲染。",
+  "fullLinkTrace": "userName 来自 GET /api/user 接口。在 created 钩子中调用 request('/api/user')，响应 res.data.name 赋值给 this.userName，模板通过插值渲染。",
   "dataSource": {{"type": "API", "endpoint": "/api/user", "method": "GET"}},
-  "componentAnalysis": [{{"file": "User.vue", "role": "数据获取组件", "dataMapping": "res.data -> this.user -> user.name"}}],
+  "componentAnalysis": [{{"file": "User.vue", "role": "数据获取组件", "dataMapping": "res.data.name -> this.userName -> 模板渲染"}}],
+  "variableAnalysis": {{
+    "content": [
+      {{"name": "userName", "apiDependency": "res.data.name", "computeLogic": "API 响应直接赋值给 data 属性", "dataChain": "API(/api/user) -> this.userName -> Template"}}
+    ],
+    "attributes": [],
+    "conditionals": []
+  }},
   "confidence": 95,
-  "relatedVariables": ["user"],
   "suggestNextStep": null
 }}
 \`\`\`
 
 **示例2：Vuex Store 数据源**
-点击元素：\`<span>多语言变量</span>\`
+点击元素：\`<span v-if="isLogin">{{{{ lang }}}}</span>\`
 输出：
 \`\`\`json
 {{
-  "fullLinkTrace": "lang 变量通过 mapState 从 Vuex 的 setting 模块映射而来，用于控制多语言显示。",
+  "fullLinkTrace": "lang 变量通过 mapState 从 Vuex 的 setting 模块映射而来，用于控制多语言显示。isLogin 控制元素是否显示。",
   "dataSource": {{"type": "Store", "endpoint": null, "method": "UNKNOWN"}},
   "componentAnalysis": [{{"file": "Header.vue", "role": "展示组件", "dataMapping": "store.setting.lang -> computed.lang"}}],
+  "variableAnalysis": {{
+    "content": [
+      {{"name": "lang", "apiDependency": null, "computeLogic": "通过 mapState 从 Vuex store 映射", "dataChain": "Store(setting.lang) -> Computed(lang) -> Template"}}
+    ],
+    "attributes": [],
+    "conditionals": [
+      {{"expression": "isLogin", "dependencies": ["isLogin"], "dataChain": "Store(user.isLogin) -> Computed -> Template", "description": "当用户已登录时显示该元素"}}
+    ]
+  }},
   "confidence": 90,
-  "relatedVariables": ["lang"],
   "suggestNextStep": "查看 src/store/modules/setting.js 中 lang 的初始化和修改逻辑"
 }}
 \`\`\`
 
 **示例3：跨组件 Props 传递**
-点击元素：\`<span>标题文本</span>\`
+点击元素：\`<Button :loading="submitting" @click="handleSubmit">{{{{ buttonText }}}}</Button>\`
 输出：
 \`\`\`json
 {{
-  "fullLinkTrace": "title 是从父组件 PageLayout 通过 props 传入的。父组件中通过 :title='pageTitle' 绑定，而 pageTitle 来自 GET /api/page 接口。",
+  "fullLinkTrace": "buttonText 是从父组件通过 props 传入。submitting 控制按钮加载状态，handleSubmit 是点击事件处理函数。",
   "dataSource": {{"type": "API", "endpoint": "/api/page", "method": "GET"}},
   "componentAnalysis": [
-    {{"file": "Child.vue", "role": "展示组件", "dataMapping": "props.title -> 模板渲染"}},
-    {{"file": "PageLayout.vue", "role": "容器组件", "dataMapping": "res.data.title -> pageTitle -> :title"}}
+    {{"file": "SubmitButton.vue", "role": "展示组件", "dataMapping": "props.buttonText -> 模板渲染"}},
+    {{"file": "FormPage.vue", "role": "容器组件", "dataMapping": "res.data.submitLabel -> buttonText -> :text"}}
   ],
+  "variableAnalysis": {{
+    "content": [
+      {{"name": "buttonText", "apiDependency": "res.data.submitLabel", "computeLogic": "父组件通过 props 传入，源自 API 响应", "dataChain": "API -> Parent(FormPage) -> Props -> Template"}}
+    ],
+    "attributes": [
+      {{"name": "submitting", "directive": ":loading", "definition": "data", "source": "组件内 data 属性，在 handleSubmit 方法中控制"}},
+      {{"name": "handleSubmit", "directive": "@click", "definition": "methods", "source": "组件内 methods 定义的提交处理函数"}}
+    ],
+    "conditionals": []
+  }},
   "confidence": 85,
-  "relatedVariables": ["title", "pageTitle"],
   "suggestNextStep": null
+}}
+\`\`\`
+
+**示例4：复杂三维度变量（完整示例）**
+点击元素：\`<div v-if="isVisible && hasPermission" :class="containerClass">{{{{ formatAmount(amount) }}}}</div>\`
+输出：
+\`\`\`json
+{{
+  "fullLinkTrace": "amount 来自 API 接口，通过 formatAmount 方法格式化后显示。containerClass 是计算属性控制样式。元素仅在 isVisible 且 hasPermission 时显示。",
+  "dataSource": {{"type": "API", "endpoint": "/api/dashboard", "method": "GET"}},
+  "componentAnalysis": [{{"file": "Dashboard.vue", "role": "数据展示组件", "dataMapping": "res.data.amount -> this.amount -> formatAmount() -> 模板渲染"}}],
+  "variableAnalysis": {{
+    "content": [
+      {{"name": "amount", "apiDependency": "res.data.amount", "computeLogic": "API 响应赋值后，通过 formatAmount 方法格式化", "dataChain": "API(/api/dashboard) -> this.amount -> formatAmount() -> Template"}},
+      {{"name": "formatAmount", "apiDependency": null, "computeLogic": "methods 中定义的格式化函数", "dataChain": "Methods -> Template"}}
+    ],
+    "attributes": [
+      {{"name": "containerClass", "directive": ":class", "definition": "computed", "source": "计算属性，根据当前状态动态返回 class 名"}}
+    ],
+    "conditionals": [
+      {{"expression": "isVisible && hasPermission", "dependencies": ["isVisible", "hasPermission"], "dataChain": "isVisible: data 属性; hasPermission: Store(user.permissions) -> Computed", "description": "当元素可见且用户有权限时显示"}}
+    ]
+  }},
+  "confidence": 88,
+  "suggestNextStep": "查看 formatAmount 方法的具体格式化逻辑"
 }}
 \`\`\`
 

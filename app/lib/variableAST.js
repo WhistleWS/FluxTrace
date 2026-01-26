@@ -2,29 +2,39 @@
  * variableAST.js - Vue 模板变量提取工具
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * 🎯 核心功能：从 Vue 模板 AST 节点中提取所有绑定的变量
+ * 🎯 核心功能：从 Vue 模板 AST 节点中提取所有绑定的变量，并按三个维度分类
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * 📚 技术背景：为什么需要提取变量？
+ * 📚 三维度变量分类：
  *
- * 当用户点击页面上的某个元素时，我们拿到的是一个 AST 节点。
- * 要追踪数据来源，首先需要知道这个节点用了哪些变量。
+ * 1. 内容变量（Content Variables）
+ *    - 来源：{{ }} 插值表达式
+ *    - 示例：{{ userName }}、{{ formatDate(createTime) }}
  *
- * 📊 示例：
+ * 2. 属性变量（Attribute Variables）
+ *    - 来源：:prop、v-bind、v-model、@event 等动态绑定
+ *    - 示例：:class="activeClass"、@click="handleClick"
  *
- *   用户点击了这个元素：
- *   ┌────────────────────────────────────────────────────────────┐
- *   │  <div :class="activeClass" @click="handleClick">          │
- *   │    {{ userName }} - {{ formatDate(createTime) }}          │
- *   │  </div>                                                   │
- *   └────────────────────────────────────────────────────────────┘
+ * 3. 条件变量（Conditional Variables）
+ *    - 来源：v-if、v-else-if、v-show 条件指令
+ *    - 示例：v-if="isVisible && hasPermission"
  *
- *   需要提取的变量：
- *   - activeClass（来自 :class 绑定）
- *   - handleClick（来自 @click 事件）
- *   - userName（来自插值表达式）
- *   - formatDate（来自插值表达式）
- *   - createTime（来自插值表达式）
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 📊 输出结构示例：
+ *
+ *   {
+ *     content: [
+ *       { name: 'userName', expression: 'userName', raw: '{{ userName }}' }
+ *     ],
+ *     attributes: [
+ *       { name: 'activeClass', directive: ':class', expression: 'activeClass' }
+ *     ],
+ *     conditionals: [
+ *       { directive: 'v-if', expression: 'isVisible', variables: ['isVisible'] }
+ *     ],
+ *     all: ['userName', 'activeClass', 'isVisible']  // 扁平列表，向后兼容
+ *   }
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -49,6 +59,21 @@
  */
 
 const { isVue3Node, extractIdentifiers } = require('./utils/astUtils');
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 常量定义
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 条件指令列表
+ * 这些指令控制元素的显示/隐藏
+ */
+const CONDITIONAL_DIRECTIVES = ['v-if', 'v-else-if', 'v-show'];
+
+/**
+ * 条件指令名称（Vue3 格式，不带 v- 前缀）
+ */
+const CONDITIONAL_DIRECTIVE_NAMES_VUE3 = ['if', 'else-if', 'show'];
 
 /**
  * 从节点属性中提取变量
@@ -426,7 +451,302 @@ function getUniversalVariables(node) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 三维度变量分类提取函数
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 提取内容变量（{{ }} 插值表达式中的变量）
+ * @param {Object} node - AST 节点
+ * @param {boolean} isVue3 - 是否为 Vue3 节点
+ * @returns {Array} 内容变量列表
+ *
+ * 📊 返回结构：
+ *   [{ name: 'userName', expression: 'userName | capitalize', raw: '{{ userName | capitalize }}' }]
+ */
+function extractContentVariables(node, isVue3) {
+    const contentVars = [];
+
+    if (!node.children) return contentVars;
+
+    node.children.forEach(child => {
+        if (isVue3) {
+            // Vue3：type 5 表示 Interpolation（插值表达式）
+            if (child.type === 5) {
+                const expression = child.content?.content || child.content;
+                if (typeof expression === 'string') {
+                    const variables = extractIdentifiers(expression);
+                    // 对每个变量进行 v-for 别名溯源
+                    const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                    contentVars.push({
+                        expression: expression,
+                        raw: `{{ ${expression} }}`,
+                        variables: [...new Set(resolvedVars)]
+                    });
+                }
+            }
+        } else {
+            // Vue2：type 2 表示表达式文本节点
+            if (child && child.type === 2 && typeof child.expression === 'string') {
+                const expression = child.expression;
+                const variables = extractIdentifiers(expression);
+                // 对每个变量进行 v-for 别名溯源
+                const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                // 尝试还原原始模板文本
+                const rawText = child.text || `{{ ${expression} }}`;
+
+                contentVars.push({
+                    expression: expression,
+                    raw: rawText,
+                    variables: [...new Set(resolvedVars)]
+                });
+            }
+        }
+    });
+
+    return contentVars;
+}
+
+/**
+ * 提取属性变量（:prop、v-bind、v-model、@event 中的变量）
+ * @param {Object} node - AST 节点
+ * @param {boolean} isVue3 - 是否为 Vue3 节点
+ * @returns {Array} 属性变量列表
+ *
+ * 📊 返回结构：
+ *   [{ name: 'disabled', directive: ':disabled', expression: '!canEdit', variables: ['canEdit'] }]
+ */
+function extractAttributeVariables(node, isVue3) {
+    const attrVars = [];
+
+    if (isVue3) {
+        // Vue3：动态属性在 node.props
+        if (node.props) {
+            node.props.forEach(prop => {
+                // 跳过条件指令（v-if、v-show 等），它们在 conditionals 中处理
+                if (CONDITIONAL_DIRECTIVE_NAMES_VUE3.includes(prop.name)) return;
+                // 跳过 v-for
+                if (prop.name === 'for') return;
+
+                if (prop.exp?.content) {
+                    const expression = prop.exp.content;
+                    const variables = extractIdentifiers(expression);
+                    const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                    // 构建指令名称
+                    let directive = '';
+                    if (prop.name === 'bind') {
+                        directive = `:${prop.arg?.content || 'unknown'}`;
+                    } else if (prop.name === 'on') {
+                        directive = `@${prop.arg?.content || 'unknown'}`;
+                    } else if (prop.name === 'model') {
+                        directive = 'v-model';
+                    } else {
+                        directive = `v-${prop.name}`;
+                    }
+
+                    attrVars.push({
+                        directive: directive,
+                        expression: expression,
+                        variables: [...new Set(resolvedVars)]
+                    });
+                }
+            });
+        }
+    } else {
+        // Vue2：动态属性在 node.attrsList
+        if (node.attrsList) {
+            node.attrsList.forEach(attr => {
+                if (!attr || typeof attr.name !== 'string') return;
+
+                const { name, value } = attr;
+
+                // 跳过条件指令
+                if (CONDITIONAL_DIRECTIVES.includes(name)) return;
+                // 跳过 v-for
+                if (name === 'v-for') return;
+                // 跳过静态属性
+                if (!value) return;
+
+                // 判断是否为动态绑定
+                const isDynamic =
+                    name.startsWith(':') ||
+                    name.startsWith('v-bind:') ||
+                    name.startsWith('@') ||
+                    name.startsWith('v-on:') ||
+                    name === 'v-model' ||
+                    (name.startsWith('v-') && !CONDITIONAL_DIRECTIVES.includes(name));
+
+                if (!isDynamic) return;
+
+                const variables = extractIdentifiers(value);
+                const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                attrVars.push({
+                    directive: name,
+                    expression: value,
+                    variables: [...new Set(resolvedVars)]
+                });
+            });
+        }
+    }
+
+    return attrVars;
+}
+
+/**
+ * 提取条件变量（v-if、v-else-if、v-show 中的变量）
+ * @param {Object} node - AST 节点
+ * @param {boolean} isVue3 - 是否为 Vue3 节点
+ * @returns {Array} 条件变量列表
+ *
+ * 📊 返回结构：
+ *   [{
+ *     directive: 'v-if',
+ *     expression: 'isLogin && hasRole',
+ *     variables: ['isLogin', 'hasRole']
+ *   }]
+ */
+function extractConditionalVariables(node, isVue3) {
+    const conditionalVars = [];
+
+    if (isVue3) {
+        // Vue3：条件指令在 node.props
+        if (node.props) {
+            node.props.forEach(prop => {
+                // 检查是否为条件指令
+                if (CONDITIONAL_DIRECTIVE_NAMES_VUE3.includes(prop.name)) {
+                    if (prop.exp?.content) {
+                        const expression = prop.exp.content;
+                        const variables = extractIdentifiers(expression);
+                        const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                        conditionalVars.push({
+                            directive: `v-${prop.name}`,
+                            expression: expression,
+                            variables: [...new Set(resolvedVars)]
+                        });
+                    }
+                }
+            });
+        }
+    } else {
+        // Vue2：条件指令在 node.attrsList
+        if (node.attrsList) {
+            node.attrsList.forEach(attr => {
+                if (!attr || typeof attr.name !== 'string') return;
+
+                const { name, value } = attr;
+
+                // 检查是否为条件指令
+                if (CONDITIONAL_DIRECTIVES.includes(name) && value) {
+                    const variables = extractIdentifiers(value);
+                    const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                    conditionalVars.push({
+                        directive: name,
+                        expression: value,
+                        variables: [...new Set(resolvedVars)]
+                    });
+                }
+            });
+        }
+
+        // Vue2 还需要检查节点上的 if/elseif 属性（编译后的结果）
+        if (node.if && node.ifConditions) {
+            node.ifConditions.forEach(cond => {
+                if (cond.exp) {
+                    const expression = cond.exp;
+                    const variables = extractIdentifiers(expression);
+                    const resolvedVars = variables.map(v => resolveVariableSource(node, v));
+
+                    // 避免重复添加
+                    const exists = conditionalVars.some(cv => cv.expression === expression);
+                    if (!exists) {
+                        conditionalVars.push({
+                            directive: 'v-if',
+                            expression: expression,
+                            variables: [...new Set(resolvedVars)]
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    return conditionalVars;
+}
+
+/**
+ * 获取分类后的变量（三维度分析）
+ * @param {Object} node - AST 节点
+ * @returns {Object} 分类后的变量对象
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🎯 这是新的主要对外接口，返回三维度分类的变量
+ *
+ * 📊 返回结构：
+ *   {
+ *     content: [{ expression, raw, variables }],
+ *     attributes: [{ directive, expression, variables }],
+ *     conditionals: [{ directive, expression, variables }],
+ *     all: ['var1', 'var2', ...]  // 扁平列表，向后兼容
+ *   }
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+function getCategorizedVariables(node) {
+    if (!node) {
+        return {
+            content: [],
+            attributes: [],
+            conditionals: [],
+            all: []
+        };
+    }
+
+    // 判断 AST 版本
+    const isVue3 = isVue3Node(node);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 分别提取三类变量
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const content = extractContentVariables(node, isVue3);
+    const attributes = extractAttributeVariables(node, isVue3);
+    const conditionals = extractConditionalVariables(node, isVue3);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 汇总所有变量（去重），用于向后兼容
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const allVarsSet = new Set();
+
+    content.forEach(item => {
+        item.variables.forEach(v => allVarsSet.add(v));
+    });
+    attributes.forEach(item => {
+        item.variables.forEach(v => allVarsSet.add(v));
+    });
+    conditionals.forEach(item => {
+        item.variables.forEach(v => allVarsSet.add(v));
+    });
+
+    return {
+        content,
+        attributes,
+        conditionals,
+        all: Array.from(allVarsSet)
+    };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 模块导出
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-module.exports = { getUniversalVariables };
+module.exports = {
+    getUniversalVariables,
+    getCategorizedVariables,
+    // 以下函数也导出，方便单元测试
+    extractContentVariables,
+    extractAttributeVariables,
+    extractConditionalVariables
+};
